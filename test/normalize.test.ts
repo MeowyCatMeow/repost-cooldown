@@ -22,6 +22,36 @@ test('non-Latin titles are kept', () => {
   assert.equal(normalizeTitle('新しい モデル！'), '新しい モデル');
 });
 
+test('letters keep their vowel signs and accents', () => {
+  assert.notEqual(normalizeTitle('कमल'), normalizeTitle('कमला'));
+  assert.equal(titleWeight(normalizeTitle('कमला')), 3);
+  assert.equal(normalizeTitle('สวัสดีครับ!'), 'สวัสดีครับ');
+  assert.notEqual(normalizeTitle('كَتَبَ'), normalizeTitle('كُتِبَ'));
+  assert.equal(normalizeTitle('Café'), normalizeTitle('Cafe\u{301}'));
+  // Marks that belonged to a removed symbol go with it: a heart and two keycaps.
+  const symbols = 'I \u{2764}\u{FE0F} this 1\u{FE0F}\u{20E3} model #\u{FE0F}\u{20E3}';
+  assert.equal(normalizeTitle(symbols), 'i this 1 model');
+});
+
+test('escaped characters are decoded before comparing', () => {
+  assert.equal(normalizeTitle('First part.\n\n&#x200B;\n\nSecond part.'), 'first part second part');
+  assert.equal(normalizeTitle('one&nbsp;two &amp;#39;three&#39;'), 'one two three');
+  assert.equal(normalizeTitle('Tom &amp;amp; Jerry &#xD800; &#0;'), 'tom amp jerry xd800 0');
+});
+
+test('a parameter or fragment that selects the page is part of the link', () => {
+  assert.notEqual(normalizeUrl('https://example.com/get?app=notes'), normalizeUrl('https://example.com/get?app=mail'));
+  assert.equal(
+    normalizeUrl('https://www.youtube.com/playlist?list=PL1&feature=shared&app=desktop'),
+    'youtube.com/playlist?list=PL1'
+  );
+  assert.equal(normalizeUrl('https://example.com/docs/#/guide/install'), 'example.com/docs#/guide/install');
+  assert.notEqual(normalizeUrl('https://example.com/docs/#/guide/install'), normalizeUrl('https://example.com/docs/#/guide/usage'));
+  assert.equal(normalizeUrl('https://example.com/docs#install'), 'example.com/docs');
+  assert.equal(isHomepage(normalizeUrl('https://example.com/#/')!), true);
+  assert.equal(isHomepage(normalizeUrl('https://example.com/#/guide')!), false);
+});
+
 test('links ignore protocol, www, tracking, fragment and trailing slash', () => {
   const a = normalizeUrl('https://www.example.com/news/story/?utm_source=x&id=5&fbclid=abc#top');
   const b = normalizeUrl('http://example.com/news/story?id=5');
@@ -102,6 +132,22 @@ test('links are found in post text', () => {
     'https://example.com/angle',
   ]);
   assert.deepEqual(linksInText(''), []);
+});
+
+test('links end at Markdown marks and invisible characters', () => {
+  const text = 'Run `https://example.com/a` or |https://example.com/b| or https://example.com/c\u{200B}. Or **https://example.com/d**';
+  assert.deepEqual(linksInText(text), [
+    'https://example.com/a',
+    'https://example.com/b',
+    'https://example.com/c',
+    'https://example.com/d',
+  ]);
+});
+
+test('a link followed by a very long run of brackets is handled quickly', () => {
+  const started = performance.now();
+  assert.deepEqual(linksInText(`https://example.com/a${')'.repeat(39000)}`), ['https://example.com/a']);
+  assert.ok(performance.now() - started < 1000);
 });
 
 test('post ids get their prefix', () => {

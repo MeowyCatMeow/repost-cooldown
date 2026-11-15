@@ -31,7 +31,7 @@
       "cooldownDays": {
         "type": "number",
         "label": "Cooldown (days)",
-        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this. Changes apply to posts made from now on.",
+        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this. A shorter cooldown applies at once; a longer one applies to posts made after the change.",
         "defaultValue": 30
       },
       "checkCrossposts": {

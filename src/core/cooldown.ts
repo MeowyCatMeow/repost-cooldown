@@ -8,10 +8,10 @@
  *   fp:title-text:<hash> -> {"id","at"} the post that currently owns this title and text
  *   fp:text:<hash>   -> {"id","at"}    the post that currently owns this body text
  *   post:<id>        -> {"at","keys"}  a known post and the fingerprints it owns
- *   seen:<id>        -> "1"            the post's submit event was already handled
+ *   seen:<id>        -> a token        the post's submit event is being, or was, handled
  * Every key expires on its own once its post is older than the cooldown.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   isHomepage,
   isRedditLink,
@@ -250,7 +250,8 @@ export function renderRemovalMessage(
     cooldown: String(values.cooldownDays),
     subreddit: values.subreddit,
   };
-  return template.replace(/\{(\w+)\}/g, (whole, name: string) => fill[name] ?? whole);
+  // Anything in braces that is not one of the names above is left as written.
+  return template.replace(/\{(\w+)\}/g, (whole, name: string) => (Object.hasOwn(fill, name) ? fill[name]! : whole));
 }
 
 function permalinkOf(info: PostInfo | undefined, id: string): string {
@@ -268,7 +269,8 @@ async function isExempt(post: IncomingPost, settings: Settings, deps: Deps): Pro
   try {
     return await deps.reddit.isModerator(post.authorName);
   } catch (error) {
-    deps.log?.(`could not check whether u/${post.authorName} is a moderator: ${String(error)}`);
+    // The log names posts only, never the people who made them.
+    deps.log?.(`could not check whether the author of ${post.id} is a moderator: ${String(error)}`);
     return false;
   }
 }
@@ -315,10 +317,13 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
   const { store, reddit } = deps;
   const cooldownMs = settings.cooldownDays * DAY_MS;
 
-  // Reddit can deliver the same event more than once.
+  // Reddit can deliver the same event more than once, even at the same moment.
+  // "Set if absent", then read back: only the delivery whose token was stored
+  // goes on, so a post is never removed and commented on twice.
   const seenKey = `seen:${post.id}`;
-  if (await store.get(seenKey)) return { action: 'duplicate-event' };
-  await store.set(seenKey, '1', { expiration: new Date(deps.now() + 2 * DAY_MS) });
+  const token = randomUUID();
+  await store.set(seenKey, token, { nx: true, expiration: new Date(deps.now() + 2 * DAY_MS) });
+  if ((await store.get(seenKey)) !== token) return { action: 'duplicate-event' };
 
   try {
     const prints = fingerprintsOf(post, settings);

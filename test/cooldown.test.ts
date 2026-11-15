@@ -30,17 +30,10 @@ class World {
   nextId = 1;
 
   store: Store = {
-    get: async (key) => {
-      const item = this.data.get(key);
-      if (!item) return undefined;
-      if (item.expiresAt !== undefined && item.expiresAt <= this.time) {
-        this.data.delete(key);
-        return undefined;
-      }
-      return item.value;
-    },
+    get: async (key) => this.read(key),
     set: async (key, value, options) => {
-      if (options?.nx && (await this.store.get(key)) !== undefined) return '';
+      // Like Redis, "set if absent" checks and writes in one step.
+      if (options?.nx && this.read(key) !== undefined) return '';
       this.data.set(key, { value, expiresAt: options?.expiration?.getTime() });
       return 'OK';
     },
@@ -48,6 +41,16 @@ class World {
       for (const key of keys) this.data.delete(key);
     },
   };
+
+  read(key: string): string | undefined {
+    const item = this.data.get(key);
+    if (!item) return undefined;
+    if (item.expiresAt !== undefined && item.expiresAt <= this.time) {
+      this.data.delete(key);
+      return undefined;
+    }
+    return item.value;
+  }
 
   deps: Deps = {
     store: this.store,
@@ -448,6 +451,51 @@ test('the same event delivered twice is handled once', async () => {
   const again = await handleNewPost(first.post, DEFAULT_SETTINGS, w.deps);
   assert.equal(again.action, 'duplicate-event');
   assert.deepEqual(w.removed, []);
+});
+
+test('the same event delivered twice at the same moment is handled once', async () => {
+  const w = new World();
+  await w.submit({ title: 'The very same title twice' });
+  const repeat = w.make({ title: 'The very same title twice' });
+  const outcomes = await Promise.all([
+    handleNewPost(repeat, DEFAULT_SETTINGS, w.deps),
+    handleNewPost(repeat, DEFAULT_SETTINGS, w.deps),
+  ]);
+  assert.deepEqual(outcomes.map((outcome) => outcome.action).sort(), ['duplicate-event', 'removed']);
+  assert.deepEqual(w.removed, [repeat.id]);
+  assert.equal(w.comments.length, 1);
+});
+
+test('titles that differ only in vowel signs are different titles', async () => {
+  const w = new World();
+  await w.submit({ title: 'आज राम ने खाना खाया और सो गया' });
+  const other = await w.submit({ title: 'आज राम ने खाने खाये और सो गये' });
+  assert.equal(other.outcome.action, 'indexed');
+  const same = await w.submit({ title: 'आज राम ने खाना खाया और सो गया!' });
+  assert.equal(same.outcome.action, 'removed');
+});
+
+test('unknown placeholders in the removal comment are left as written', async () => {
+  const w = new World();
+  const custom = { ...DEFAULT_SETTINGS, removalMessage: 'Removed, u/{author}. {constructor} {toString} {unknown}' };
+  await w.submit({ title: 'The very same title twice' }, custom);
+  await w.submit({ title: 'The very same title twice', authorName: 'bob' }, custom);
+  assert.equal(w.comments[0]!.text, 'Removed, u/bob. {constructor} {toString} {unknown}');
+});
+
+test('the log names posts, never their authors', async () => {
+  const w = new World();
+  const lines: string[] = [];
+  w.deps.log = (line) => lines.push(line);
+  w.deps.reddit.isModerator = async () => {
+    throw new Error('reddit is down');
+  };
+  await w.submit({ title: 'The very same title twice' });
+  const repeat = await w.submit({ title: 'The very same title twice', authorName: 'someuser' });
+  assert.equal(repeat.outcome.action, 'removed');
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.includes(repeat.post.id));
+  assert.ok(!lines[0]!.includes('someuser'));
 });
 
 test('a failed removal can be retried', async () => {
