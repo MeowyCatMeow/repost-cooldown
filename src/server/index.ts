@@ -90,12 +90,13 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   };
   const current = await loadSettings();
   const outcome = await handleNewPost(post, current, deps());
-  // One line per post, so the app's log explains every decision.
-  const who = `${post.id} by u/${post.authorName}`;
+  // One line per post, so the app's log explains every decision. Post ids
+  // only: no usernames, links or text from the subreddits that install the app.
+  const who = post.id;
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
     log(`${who}: ${outcome.action} (${outcome.reason} match with ${outcome.originalId})`);
   } else if (outcome.action === 'indexed') {
-    const kind = post.isSelf ? 'text post' : `link ${post.url}`;
+    const kind = post.isSelf ? 'text post' : 'link post';
     log(
       `${who}: kept, ${kind}, compared by [${outcome.compared.join(', ') || 'nothing'}], ` +
         `cooldown ${current.cooldownDays}d, min title ${current.minTitleLength}, min text ${current.minTextLength}`
