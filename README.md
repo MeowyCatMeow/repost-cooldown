@@ -48,24 +48,3 @@ Moderators can change these from the app's settings page in the subreddit:
 A longer cooldown applies to posts made after the change; a shorter one applies at once.
 
 When the app is installed it reads the subreddit's recent posts (Reddit lists up to 1000), so reposts of posts made before the install are caught too. Moderators can repeat this from the subreddit menu: **Repost Cooldown: rescan recent posts**.
-
-## Development
-
-Requires Node.js 22 or newer. On Windows, keep the project in a folder with a short path.
-
-```bash
-npm install
-npm test
-npm run type-check
-npx devvit login
-npx devvit playtest <your-test-subreddit>
-npx devvit upload
-```
-
-`devvit playtest` and `devvit upload` build the server bundle themselves (`npm run build`).
-
-The app name in `devvit.json` must be unique on Reddit. If `repost-cooldown` is taken, change `name` there.
-
-- `src/core/normalize.ts`: turns links and titles into comparable forms.
-- `src/core/cooldown.ts`: the rules. No Devvit imports, so it is tested directly in `test/`.
-- `src/server/index.ts`: the endpoints Reddit calls, declared in `devvit.json`.
