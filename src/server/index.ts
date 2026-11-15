@@ -165,8 +165,10 @@ const server = createServer(async (req, res) => {
     status = 500;
     body = { status: 'error', message: error instanceof Error ? error.message : String(error) };
   }
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(body));
+  // Devvit rejects a response that has a body but no Content-Length.
+  const payload = Buffer.from(JSON.stringify(body), 'utf8');
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': payload.byteLength });
+  res.end(payload);
 });
 
 server.on('error', (error) => console.error('[repost-cooldown] server error:', error));
