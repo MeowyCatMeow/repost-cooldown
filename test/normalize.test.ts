@@ -46,10 +46,38 @@ test('a parameter or fragment that selects the page is part of the link', () => 
     'youtube.com/playlist?list=PL1'
   );
   assert.equal(normalizeUrl('https://example.com/docs/#/guide/install'), 'example.com/docs#/guide/install');
-  assert.notEqual(normalizeUrl('https://example.com/docs/#/guide/install'), normalizeUrl('https://example.com/docs/#/guide/usage'));
+  const pairs = [
+    ['https://example.com/docs/#/guide/install', 'https://example.com/docs/#/guide/usage'],
+    ['https://www.typescriptlang.org/play/?#code/AAAA', 'https://www.typescriptlang.org/play/?#code/BBBB'],
+    ['https://mermaid.live/edit#pako:eNpAAA', 'https://mermaid.live/edit#pako:eNpBBB'],
+    ['https://groups.google.com/forum/#!topic/a/1', 'https://groups.google.com/forum/#!topic/b/2'],
+    ['https://www.youtube.com/embed/videoseries?list=PLa', 'https://www.youtube.com/embed/videoseries?list=PLb'],
+    ['https://x.com/search?q=claude', 'https://x.com/search?q=gemini'],
+  ];
+  for (const [one, other] of pairs) assert.notEqual(normalizeUrl(one!), normalizeUrl(other!), one);
+
+  // A place on a page is still the same page.
   assert.equal(normalizeUrl('https://example.com/docs#install'), 'example.com/docs');
+  assert.equal(normalizeUrl('https://example.com/docs#L10-L20'), 'example.com/docs');
+  assert.equal(normalizeUrl('https://example.com/docs#:~:text=some%20words'), 'example.com/docs');
   assert.equal(isHomepage(normalizeUrl('https://example.com/#/')!), true);
   assert.equal(isHomepage(normalizeUrl('https://example.com/#/guide')!), false);
+  assert.equal(isHomepage(normalizeUrl('https://excalidraw.com/#json=abc,def')!), false);
+});
+
+test('X posts are known by their number, other X pages by what selects them', () => {
+  assert.equal(normalizeUrl('https://x.com/i/status/123'), 'x.com/status/123');
+  assert.equal(normalizeUrl('https://twitter.com/Sama/status/123/photo/1?s=20'), 'x.com/status/123');
+  assert.equal(normalizeUrl('https://x.com/search?q=claude&src=typed_query'), 'x.com/search?q=claude');
+  assert.equal(normalizeUrl('https://mobile.twitter.com/Sama?s=21&t=abc'), 'x.com/sama');
+});
+
+test('a site keeps its own name', () => {
+  assert.equal(normalizeUrl('https://mobile.de/x'), normalizeUrl('https://www.mobile.de/x'));
+  assert.equal(normalizeUrl('https://amp.dev/docs'), 'amp.dev/docs');
+  assert.equal(normalizeUrl('https://m.me/someone'), 'm.me/someone');
+  assert.equal(normalizeUrl('https://en.m.wikipedia.org/wiki/Reddit'), normalizeUrl('https://en.wikipedia.org/wiki/Reddit'));
+  assert.equal(normalizeUrl('https://m.youtube.com/playlist?list=PL1'), 'youtube.com/playlist?list=PL1');
 });
 
 test('links ignore protocol, www, tracking, fragment and trailing slash', () => {
@@ -114,6 +142,8 @@ test('front pages are recognised', () => {
 test('Reddit links are recognised', () => {
   assert.equal(isRedditLink(normalizeUrl('https://old.reddit.com/r/ai/comments/1abc2d/x/')!), true);
   assert.equal(isRedditLink(normalizeUrl('https://www.reddit.com/r/ai/')!), true);
+  assert.equal(isRedditLink(normalizeUrl('https://i.redd.it/chart1.png')!), true);
+  assert.equal(isRedditLink(normalizeUrl('https://preview.redd.it/abc.png?width=640&s=1')!), true);
   assert.equal(isRedditLink(normalizeUrl('https://redditstatus.com/incidents/1')!), false);
 });
 

@@ -4,6 +4,7 @@ import {
   DEFAULT_SETTINGS,
   handleNewPost,
   handlePostDeleted,
+  handlePostEdited,
   indexExistingPosts,
   parseSettings,
   type Deps,
@@ -483,7 +484,7 @@ test('unknown placeholders in the removal comment are left as written', async ()
   assert.equal(w.comments[0]!.text, 'Removed, u/bob. {constructor} {toString} {unknown}');
 });
 
-test('the log names posts, never their authors', async () => {
+test('a post stays up when its author cannot be checked, and the log names no one', async () => {
   const w = new World();
   const lines: string[] = [];
   w.deps.log = (line) => lines.push(line);
@@ -492,10 +493,89 @@ test('the log names posts, never their authors', async () => {
   };
   await w.submit({ title: 'The very same title twice' });
   const repeat = await w.submit({ title: 'The very same title twice', authorName: 'someuser' });
-  assert.equal(repeat.outcome.action, 'removed');
+  assert.equal(repeat.outcome.action, 'exempt');
   assert.equal(lines.length, 1);
   assert.ok(lines[0]!.includes(repeat.post.id));
   assert.ok(!lines[0]!.includes('someuser'));
+
+  // The same goes for a post that arrives without its author's name.
+  const nameless = await w.submit({ title: 'The very same title twice', authorName: '' });
+  assert.equal(nameless.outcome.action, 'exempt');
+  assert.deepEqual(w.removed, []);
+  assert.equal(w.comments.length, 0);
+});
+
+test('with the crosspost check off, a crosspost inside the subreddit is kept', async () => {
+  const w = new World();
+  const off = { ...DEFAULT_SETTINGS, checkCrossposts: false };
+  const picture = 'https://i.redd.it/pic1.jpg';
+  const original = await w.submit({ title: 'New model released today', url: picture }, off);
+  w.advance(1);
+  // A crosspost carries the link and the title of the post it shows.
+  const cross = await w.submit({ title: 'New model released today', url: picture, crosspostParentId: original.post.id }, off);
+  assert.equal(cross.outcome.action, 'indexed');
+  // The same picture posted again, not as a crosspost, is still a repost.
+  const repost = await w.submit({ title: 'Different words for the same thing', url: picture }, off);
+  assert.deepEqual(repost.outcome, { action: 'removed', reason: 'link', originalId: original.post.id });
+});
+
+test('a text post that quotes a picture posted earlier is kept', async () => {
+  const w = new World();
+  const picture = 'https://i.redd.it/chart1.png';
+  await w.submit({ title: 'A chart of this year so far', url: picture });
+  const talk = await w.submit({
+    title: 'About that chart from earlier today',
+    body: `I think ${picture} is misleading because of where its axis starts.`,
+    isSelf: true,
+  });
+  assert.equal(talk.outcome.action, 'indexed');
+});
+
+test('stored values of an unexpected shape are ignored', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice' });
+  for (const [key, item] of w.data) {
+    if (key.startsWith('fp:')) item.value = JSON.stringify({ id: first.post.id });
+    if (key.startsWith('post:')) item.value = JSON.stringify({ at: first.post.createdAt });
+  }
+  w.advance(1);
+  const second = await w.submit({ title: 'The very same title twice' });
+  assert.equal(second.outcome.action, 'indexed');
+  await handlePostDeleted(first.post.id, w.deps);
+  assert.equal(w.data.has(`post:${first.post.id}`), false);
+});
+
+test('an edit frees what the post no longer contains and records what it contains now', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
+  // The author swaps the link for another one.
+  const edited = { ...first.post, body: 'Details here: https://example.com/new-page' };
+  assert.equal(await handlePostEdited(edited, DEFAULT_SETTINGS, w.deps), true);
+
+  w.advance(1);
+  const video = await w.submit({ title: 'Just the video on its own', url: VIDEO });
+  assert.equal(video.outcome.action, 'indexed');
+  const page = await w.submit({ title: 'A link to the new page', url: 'https://example.com/new-page' });
+  assert.deepEqual(page.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+  // The edit did not restart the first post's cooldown.
+  assert.match(w.comments[0]!.text, /1 day ago/);
+});
+
+test('an edit never removes a post or takes over what another post owns', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Watch this one before the weekend', url: VIDEO });
+  w.advance(1);
+  const second = await w.submit({ title: 'Something else entirely for now', body: 'Nothing to see yet.', isSelf: true });
+  // The second post is edited to contain the first post's link.
+  assert.equal(await handlePostEdited({ ...second.post, body: `Now with ${VIDEO}` }, DEFAULT_SETTINGS, w.deps), true);
+  assert.deepEqual(w.removed, []);
+
+  w.advance(1);
+  const third = await w.submit({ title: 'Third time for the same video', url: VIDEO });
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+
+  // An edit to a post the app is not tracking, such as one it removed, changes nothing.
+  assert.equal(await handlePostEdited({ ...third.post, body: 'Edited after removal' }, DEFAULT_SETTINGS, w.deps), false);
 });
 
 test('a failed removal can be retried', async () => {

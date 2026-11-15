@@ -25,8 +25,9 @@ const TRACKING_PARAMS = new Set([
   'share_id',
 ]);
 
-/** Share parameters that mean nothing on YouTube but can select a page on another site. */
+/** Share parameters that mean nothing on one site but can select a page on another. */
 const YOUTUBE_ONLY_PARAMS = new Set(['feature', 'app']);
+const TWITTER_ONLY_PARAMS = new Set(['s', 't', 'src']);
 
 /**
  * Undoes HTML escaping. Reddit escapes text in some places and not in others,
@@ -94,11 +95,17 @@ function parseUrl(raw: string): URL | undefined {
 }
 
 function bareHost(url: URL): string {
-  let host = url.hostname.toLowerCase();
+  const host = url.hostname.toLowerCase();
   // Reddit has many front ends (old., new., np., sh., ...) for the same pages.
   if (/(^|\.)reddit\.com$/.test(host)) return 'reddit.com';
-  host = host.replace(/^(www|m|mobile|amp)\./, '');
-  return host;
+  return (
+    host
+      // "www.", "m." and the like name the same site, unless what follows is
+      // not a site on its own: "mobile.de" and "amp.dev" are left whole.
+      .replace(/^(www|m|mobile|amp)\.(?=[^.]+\.)/, '')
+      // Wikipedia and its sister sites put the "m." in the middle.
+      .replace(/\.m\.(?=[^.]+\.[^.]+$)/, '.')
+  );
 }
 
 function redditPostIdFromParts(host: string, segments: string[]): string | undefined {
@@ -135,13 +142,27 @@ function youtubeVideoId(host: string, url: URL, segments: string[]): string | un
   if (host === 'youtu.be') return segments[0];
   if (!YOUTUBE_HOSTS.has(host)) return undefined;
   if (segments[0] === 'watch') return url.searchParams.get('v') ?? undefined;
-  if (segments[0] && ['shorts', 'live', 'embed', 'v'].includes(segments[0])) return segments[1];
+  if (segments[0] && ['shorts', 'live', 'embed', 'v'].includes(segments[0])) {
+    // "embed/videoseries" is a playlist player; its "list" parameter says which.
+    return segments[1] === 'videoseries' ? undefined : segments[1];
+  }
   return undefined;
 }
 
 /**
+ * The part of an address after "#", when it selects what the page shows.
+ * "#section", "#L10-L20" and "#:~:text=..." only point into a page and are
+ * dropped; "#/guide", "#!topic/x" and "#code/abc" are how some sites address
+ * the page itself, and two of those are different links.
+ */
+function pageState(hash: string): string {
+  if (hash.startsWith('#:~:') || /^#[\p{L}\p{N}_.~%-]*$/u.test(hash)) return '';
+  return /^#!?\/?$/.test(hash) ? '' : hash;
+}
+
+/**
  * A comparable form of a link: no protocol, `www.`, tracking parameters,
- * fragment or trailing slash, and one spelling for the sites that have
+ * page anchor or trailing slash, and one spelling for the sites that have
  * several (Reddit, YouTube, X/Twitter). `undefined` when there is no usable link.
  */
 export function normalizeUrl(raw: string): string | undefined {
@@ -156,25 +177,27 @@ export function normalizeUrl(raw: string): string | undefined {
   const videoId = youtubeVideoId(host, url, segments);
   if (videoId) return `youtube.com/watch?v=${videoId}`;
 
-  if (TWITTER_HOSTS.has(host)) {
-    return segments.length ? `x.com/${segments.join('/').toLowerCase()}` : 'x.com';
+  // X/Twitter has several names for one site, and ignores capitals in its addresses.
+  const twitter = TWITTER_HOSTS.has(host);
+  const site = twitter ? 'x.com' : `${host}${url.port ? `:${url.port}` : ''}`;
+  const path = twitter ? segments.join('/').toLowerCase() : segments.join('/');
+  if (twitter) {
+    // A post there is known by its number alone, whoever's name is in front of it.
+    const parts = path.split('/');
+    const status = parts[parts.indexOf('status') + 1];
+    if (parts.includes('status') && status) return `x.com/status/${status}`;
   }
 
+  const siteParams = twitter ? TWITTER_ONLY_PARAMS : YOUTUBE_HOSTS.has(host) ? YOUTUBE_ONLY_PARAMS : undefined;
   const params = [...url.searchParams.entries()]
     .filter(([name]) => {
       const key = name.toLowerCase();
-      if (key.startsWith('utm_') || TRACKING_PARAMS.has(key)) return false;
-      return !(YOUTUBE_ONLY_PARAMS.has(key) && YOUTUBE_HOSTS.has(host));
+      return !key.startsWith('utm_') && !TRACKING_PARAMS.has(key) && !siteParams?.has(key);
     })
     .sort(([a, av], [b, bv]) => (a === b ? av.localeCompare(bv) : a.localeCompare(b)))
     .map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`)
     .join('&');
-  const port = url.port ? `:${url.port}` : '';
-  const path = segments.length ? `/${segments.join('/')}` : '';
-  // A fragment is normally a place on a page, but some sites keep the page
-  // itself there ("#/guide/install"), and two such pages are different links.
-  const route = /^#!?\/./.test(url.hash) ? url.hash : '';
-  return `${host}${port}${path}${params ? `?${params}` : ''}${route}`;
+  return `${site}${path ? `/${path}` : ''}${params ? `?${params}` : ''}${pageState(url.hash)}`;
 }
 
 /**
@@ -182,12 +205,16 @@ export function normalizeUrl(raw: string): string | undefined {
  * `youtube.com`. Front pages say nothing about what was shared.
  */
 export function isHomepage(normalizedUrl: string): boolean {
-  return !normalizedUrl.includes('/') && !normalizedUrl.includes('?');
+  return !/[/?#]/.test(normalizedUrl);
 }
 
-/** True when a normalized link points at Reddit itself (a post, a subreddit, a user). */
+/**
+ * True when a normalized link points at Reddit itself: a post, a subreddit,
+ * a user, or a picture or video that Reddit hosts ("i.redd.it", "v.redd.it").
+ */
 export function isRedditLink(normalizedUrl: string): boolean {
-  return normalizedUrl === 'reddit.com' || normalizedUrl.startsWith('reddit.com/') || normalizedUrl.startsWith('redd.it/');
+  const host = normalizedUrl.split(/[/?#:]/, 1)[0] ?? '';
+  return host === 'reddit.com' || host === 'redd.it' || host.endsWith('.redd.it');
 }
 
 /** Characters that end a sentence or belong to Markdown, not to the address before them. */

@@ -1,14 +1,22 @@
 /**
  * Devvit entry point. Reddit calls these endpoints (declared in devvit.json)
- * when a post is submitted or deleted, when the app is installed, and when a
- * moderator picks the rescan menu item. The rules live in ../core/cooldown.ts.
+ * when a post is submitted, edited or deleted, when the app is installed or
+ * updated, and when a moderator picks the rescan menu item. The rules live in
+ * ../core/cooldown.ts.
  */
 import type { IncomingMessage } from 'node:http';
 import { context, createServer, getServerPort, reddit, redis, settings } from '@devvit/web/server';
-import type { MenuItemRequest, OnPostDeleteRequest, OnPostSubmitRequest, UiResponse } from '@devvit/web/shared';
+import type {
+  MenuItemRequest,
+  OnPostDeleteRequest,
+  OnPostSubmitRequest,
+  OnPostUpdateRequest,
+  UiResponse,
+} from '@devvit/web/shared';
 import {
   handleNewPost,
   handlePostDeleted,
+  handlePostEdited,
   indexExistingPosts,
   parseSettings,
   toMillis,
@@ -20,6 +28,8 @@ import {
 import { toPostId } from '../core/normalize.ts';
 
 type PostId = `t3_${string}`;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function log(message: string): void {
   console.log(`[repost-cooldown] ${message}`);
@@ -46,7 +56,12 @@ const gateway: RedditGateway = {
   },
   async comment(id, text) {
     const comment = await reddit.submitComment({ id: id as PostId, text });
-    await comment.distinguish(true);
+    try {
+      await comment.distinguish(true);
+    } catch (error) {
+      // The comment is there; it is only not pinned to the top.
+      log(`commented on ${id} but could not pin the comment: ${String(error)}`);
+    }
   },
   async addRemovalNote(id, note) {
     await reddit.addRemovalNote({ itemIds: [id], reasonId: '', modNote: note.slice(0, 100) });
@@ -64,19 +79,19 @@ function deps(): Deps {
   };
 }
 
+/**
+ * The moderators' settings. Throws when they cannot be read: carrying on with
+ * the defaults could remove posts under rules the moderators have switched off.
+ */
 async function loadSettings(): Promise<Settings> {
-  try {
-    return parseSettings(await settings.getAll<Record<string, unknown>>());
-  } catch (error) {
-    log(`could not read settings, using defaults: ${String(error)}`);
-    return parseSettings(undefined);
-  }
+  return parseSettings(await settings.getAll<Record<string, unknown>>());
 }
 
-async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
+/** The post in a submit or edit event, or `undefined` when the event carries none. */
+function incomingPost(event: Pick<OnPostSubmitRequest, 'post' | 'author' | 'subreddit'>): IncomingPost | undefined {
   const id = toPostId(event.post?.id);
-  if (!event.post || !id) return;
-  const post: IncomingPost = {
+  if (!event.post || !id) return undefined;
+  return {
     id,
     title: event.post.title ?? '',
     url: event.post.url ?? '',
@@ -88,6 +103,11 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
     subredditId: event.post.subredditId || event.subreddit?.id || context.subredditId,
     subredditName: event.subreddit?.name || context.subredditName,
   };
+}
+
+async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
+  const post = incomingPost(event);
+  if (!post) return;
   const current = await loadSettings();
   const outcome = await handleNewPost(post, current, deps());
   // One line per post, so the app's log explains every decision. Post ids
@@ -106,6 +126,13 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   }
 }
 
+/** An edit can add or take away the links and text a post is compared by. */
+async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
+  const post = incomingPost(event);
+  if (!post) return;
+  if (await handlePostEdited(post, await loadSettings(), deps())) log(`${post.id}: edited, recorded again`);
+}
+
 async function onPostDelete(event: OnPostDeleteRequest): Promise<void> {
   await handlePostDeleted(event.postId, { store: redis });
 }
@@ -113,10 +140,18 @@ async function onPostDelete(event: OnPostDeleteRequest): Promise<void> {
 /** Reads the subreddit's newest posts (Reddit lists at most 1000) and records them. */
 async function rescan(): Promise<number> {
   const subredditName = context.subredditName;
-  const listed = await reddit.getNewPosts({ subredditName, limit: 1000, pageSize: 100 }).all();
-  const posts: IncomingPost[] = listed
-    .filter((post) => !post.removed && !post.spam && !post.removedByCategory)
-    .map((post) => ({
+  // Recording removes nothing, so the defaults are a safe stand-in when the settings cannot be read.
+  const current = await loadSettings().catch((error: unknown) => {
+    log(`could not read the settings, recording with the defaults: ${String(error)}`);
+    return parseSettings(undefined);
+  });
+  const oldest = Date.now() - current.cooldownDays * DAY_MS;
+  const posts: IncomingPost[] = [];
+  // The listing is newest first, so reading stops at the first post that is past the cooldown.
+  for await (const post of reddit.getNewPosts({ subredditName, limit: 1000, pageSize: 100 })) {
+    if (post.createdAt.getTime() < oldest) break;
+    if (post.removed || post.spam || post.removedByCategory || post.authorName === '[deleted]') continue;
+    posts.push({
       id: post.id,
       title: post.title,
       url: post.url,
@@ -126,8 +161,9 @@ async function rescan(): Promise<number> {
       crosspostParentId: post.crosspostParentId,
       subredditId: post.subredditId,
       subredditName,
-    }));
-  return indexExistingPosts(posts, await loadSettings(), deps());
+    });
+  }
+  return indexExistingPosts(posts, current, deps());
 }
 
 async function readJson<T>(req: IncomingMessage): Promise<T> {
@@ -142,6 +178,9 @@ async function route(req: IncomingMessage): Promise<object | undefined> {
   switch (path) {
     case '/internal/triggers/post-submit':
       await onPostSubmit(await readJson<OnPostSubmitRequest>(req));
+      return {};
+    case '/internal/triggers/post-update':
+      await onPostUpdate(await readJson<OnPostUpdateRequest>(req));
       return {};
     case '/internal/triggers/post-delete':
       await onPostDelete(await readJson<OnPostDeleteRequest>(req));

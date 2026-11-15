@@ -11,6 +11,7 @@
   },
   "triggers": {
     "onPostSubmit": "/internal/triggers/post-submit",
+    "onPostUpdate": "/internal/triggers/post-update",
     "onPostDelete": "/internal/triggers/post-delete",
     "onAppInstall": "/internal/triggers/app-install",
     "onAppUpgrade": "/internal/triggers/app-upgrade"
@@ -31,7 +32,7 @@
       "cooldownDays": {
         "type": "number",
         "label": "Cooldown (days)",
-        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this. A shorter cooldown applies at once; a longer one applies to posts made after the change.",
+        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this. A shorter cooldown applies at once; a longer one is only certain to cover posts made after the change.",
         "defaultValue": 30
       },
       "checkCrossposts": {

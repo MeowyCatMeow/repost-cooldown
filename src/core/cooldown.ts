@@ -166,13 +166,29 @@ function hash(text: string): string {
   return createHash('sha256').update(text).digest('hex').slice(0, 32);
 }
 
-function parseJson<T>(text: string | undefined | null): T | undefined {
+function parseJson(text: string | undefined | null): Record<string, unknown> | undefined {
   if (!text) return undefined;
   try {
-    return JSON.parse(text) as T;
+    const value: unknown = JSON.parse(text);
+    return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** A stored fingerprint owner, or `undefined` when the value is missing or not in that shape. */
+function readEntry(text: string | undefined | null): Entry | undefined {
+  const value = parseJson(text);
+  if (typeof value?.id !== 'string' || typeof value.at !== 'number' || !Number.isFinite(value.at)) return undefined;
+  return { id: value.id, at: value.at };
+}
+
+/** A stored post record, or `undefined` when the value is missing or not in that shape. */
+function readRecord(text: string | undefined | null): PostRecord | undefined {
+  const value = parseJson(text);
+  if (typeof value?.at !== 'number' || !Number.isFinite(value.at)) return undefined;
+  const keys = Array.isArray(value.keys) ? value.keys.filter((key): key is string => typeof key === 'string') : [];
+  return { at: value.at, keys };
 }
 
 /** Reddit reports times in seconds in some places and milliseconds in others. */
@@ -260,18 +276,21 @@ function permalinkOf(info: PostInfo | undefined, id: string): string {
   return `https://www.reddit.com/comments/${id.replace(/^t3_/, '')}`;
 }
 
+/** True when the post must stay up: its author is exempt, or cannot be checked. */
 async function isExempt(post: IncomingPost, settings: Settings, deps: Deps): Promise<boolean> {
   const author = post.authorName.toLowerCase();
-  if (!author) return false;
+  // Without a name there is no telling who posted it, so it is left alone.
+  if (!author) return true;
   if (author === 'automoderator') return true;
   if (deps.exemptAuthors?.some((name) => name.toLowerCase() === author)) return true;
   if (!settings.exemptModerators) return false;
   try {
     return await deps.reddit.isModerator(post.authorName);
   } catch (error) {
+    // A moderator's post must not be removed because Reddit failed to answer.
     // The log names posts only, never the people who made them.
-    deps.log?.(`could not check whether the author of ${post.id} is a moderator: ${String(error)}`);
-    return false;
+    deps.log?.(`could not check whether the author of ${post.id} is a moderator, so it stays up: ${String(error)}`);
+    return true;
   }
 }
 
@@ -302,7 +321,7 @@ async function indexPost(
     }
     // "Set if absent", then read back: only one of two simultaneous posts wins.
     await deps.store.set(print.key, value, { nx: true, expiration });
-    const current = parseJson<Entry>(await deps.store.get(print.key));
+    const current = readEntry(await deps.store.get(print.key));
     if (current?.id === post.id) owned.push(print.key);
   }
   const record: PostRecord = { at: post.createdAt, keys: owned };
@@ -345,24 +364,23 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
     type Candidate = { reason: Reason; id: string; at: number; key?: string };
     const candidates: Candidate[] = [];
 
-    if (settings.checkCrossposts) {
-      // A plain link to a post is treated like a crosspost of it.
-      const parentId =
-        toPostId(post.crosspostParentId) ?? (post.isSelf ? undefined : redditPostIdFromUrl(post.url));
-      if (parentId && parentId !== post.id) {
-        const known = parseJson<PostRecord>(await store.get(`post:${parentId}`));
-        if (known) {
-          candidates.push({ reason: 'crosspost', id: parentId, at: known.at });
-        } else {
-          const parent = await getInfo(parentId);
-          if (parent && parent.subredditId === post.subredditId) {
-            candidates.push({ reason: 'crosspost', id: parentId, at: parent.createdAt });
-          }
+    // The post this one is a crosspost of. A plain link to a post is treated like a crosspost of it.
+    const linkedId = toPostId(post.crosspostParentId) ?? (post.isSelf ? undefined : redditPostIdFromUrl(post.url));
+    const parentId = linkedId !== post.id ? linkedId : undefined;
+
+    if (settings.checkCrossposts && parentId) {
+      const known = readRecord(await store.get(`post:${parentId}`));
+      if (known) {
+        candidates.push({ reason: 'crosspost', id: parentId, at: known.at });
+      } else {
+        const parent = await getInfo(parentId);
+        if (parent && parent.subredditId === post.subredditId) {
+          candidates.push({ reason: 'crosspost', id: parentId, at: parent.createdAt });
         }
       }
     }
     for (const print of prints) {
-      const entry = parseJson<Entry>(await store.get(print.key));
+      const entry = readEntry(await store.get(print.key));
       if (entry) candidates.push({ reason: print.kind, id: entry.id, at: entry.at, key: print.key });
     }
 
@@ -370,6 +388,9 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
     let match: Candidate | undefined;
     for (const candidate of candidates) {
       if (candidate.id === post.id) continue;
+      // With the crosspost check switched off, crossposts are allowed: one is
+      // not a repost of the very post it shows, whose link and title it carries.
+      if (!settings.checkCrossposts && candidate.id === parentId) continue;
       const age = post.createdAt - candidate.at;
       if (age >= cooldownMs) {
         if (candidate.key) replaceable.add(candidate.key);
@@ -436,13 +457,36 @@ export async function handlePostDeleted(rawId: string, deps: Pick<Deps, 'store'>
   const id = toPostId(rawId);
   if (!id) return;
   const recordKey = `post:${id}`;
-  const record = parseJson<PostRecord>(await deps.store.get(recordKey));
+  const record = readRecord(await deps.store.get(recordKey));
   if (!record) return;
   for (const key of record.keys) {
-    const entry = parseJson<Entry>(await deps.store.get(key));
+    const entry = readEntry(await deps.store.get(key));
     if (entry?.id === id) await deps.store.del(key);
   }
   await deps.store.del(recordKey);
+}
+
+/**
+ * Re-reads a post that was edited: gives up what it no longer contains and
+ * records what it contains now, so that nothing is removed for repeating a
+ * link or text that is no longer there. An edit never gets a post removed.
+ * Returns whether the post is one the app keeps track of.
+ */
+export async function handlePostEdited(post: IncomingPost, settings: Settings, deps: Deps): Promise<boolean> {
+  // A post the app removed, one past the cooldown, or one it never saw has no record.
+  const record = readRecord(await deps.store.get(`post:${post.id}`));
+  if (!record) return false;
+
+  const prints = fingerprintsOf(post, settings);
+  const kept = new Set(prints.map((print) => print.key));
+  for (const key of record.keys) {
+    if (kept.has(key)) continue;
+    const entry = readEntry(await deps.store.get(key));
+    if (entry?.id === post.id) await deps.store.del(key);
+  }
+  // The post keeps the age it was recorded with; an edit does not restart its cooldown.
+  await indexPost({ ...post, createdAt: record.at }, prints, settings.cooldownDays * DAY_MS, new Set(), deps);
+  return true;
 }
 
 /**
@@ -457,23 +501,29 @@ export async function indexExistingPosts(posts: IncomingPost[], settings: Settin
     .filter((post) => post.createdAt + cooldownMs > now)
     .sort((a, b) => a.createdAt - b.createdAt);
 
+  // Ownership is decided oldest first: the oldest post with a link or title is the original.
   const owner = new Map<string, string>();
-  const writes: Array<() => Promise<unknown>> = [];
+  const perPost: Array<Array<() => Promise<unknown>>> = [];
   for (const post of recent) {
     const expiration = new Date(post.createdAt + cooldownMs + HOUR_MS);
     const value = JSON.stringify({ id: post.id, at: post.createdAt } satisfies Entry);
     const owned: string[] = [];
+    const steps: Array<() => Promise<unknown>> = [];
     for (const print of fingerprintsOf(post, settings)) {
       if (owner.has(print.key)) continue;
       owner.set(print.key, post.id);
       owned.push(print.key);
       // "Set if absent" keeps whatever the live trigger has already recorded.
-      writes.push(() => deps.store.set(print.key, value, { nx: true, expiration }));
+      steps.push(() => deps.store.set(print.key, value, { nx: true, expiration }));
     }
     const record: PostRecord = { at: post.createdAt, keys: owned };
     // Rewritten on every pass, so a rescan after an update picks up new kinds of key.
-    writes.push(() => deps.store.set(`post:${post.id}`, JSON.stringify(record), { expiration }));
+    steps.push(() => deps.store.set(`post:${post.id}`, JSON.stringify(record), { expiration }));
+    perPost.push(steps);
   }
+  // Written newest first: if Reddit cuts a long pass short, what is missing is
+  // the oldest posts, which have the least of their cooldown left.
+  const writes = perPost.reverse().flat();
 
   const BATCH = 25;
   for (let i = 0; i < writes.length; i += BATCH) {
