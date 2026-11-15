@@ -23,7 +23,7 @@ When a post is edited, the app reads it again. A link or text that was edited ou
 
 If a moderator removes a post, it still counts as an original for the rest of its cooldown. Posting it again is removed too, with a comment that says so. Deleting or editing the removed post does not change that. If a moderator approves the post again, it is an ordinary post again.
 
-Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. This covers removals made while the app is installed, and it can be switched off.
+Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's. This covers removals made while the app is installed, and it can be switched off.
 
 ## What is left alone
 
