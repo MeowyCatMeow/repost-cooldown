@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { normalizeTitle, normalizeUrl, redditPostIdFromUrl, titleWeight, toPostId } from '../src/core/normalize.ts';
+import {
+  isHomepage,
+  isRedditLink,
+  linksInText,
+  normalizeTitle,
+  normalizeUrl,
+  redditPostIdFromUrl,
+  titleWeight,
+  toPostId,
+} from '../src/core/normalize.ts';
 
 test('titles ignore case, punctuation, emoji and spacing', () => {
   assert.equal(normalizeTitle('  OpenAI releases GPT-6!!! 🚀 '), normalizeTitle('openai releases gpt 6'));
@@ -61,6 +70,38 @@ test('unusable links are ignored', () => {
   assert.equal(normalizeUrl(''), undefined);
   assert.equal(normalizeUrl('not a url'), undefined);
   assert.equal(normalizeUrl('mailto:someone@example.com'), undefined);
+});
+
+test('front pages are recognised', () => {
+  for (const url of ['https://www.youtube.com/', 'http://youtube.com', 'https://x.com/', 'https://example.com/?utm_source=a#top']) {
+    assert.equal(isHomepage(normalizeUrl(url)!), true, url);
+  }
+  for (const url of ['https://www.youtube.com/watch?v=45RTkHgR3Gc', 'https://example.com/shop', 'https://example.com/?id=5']) {
+    assert.equal(isHomepage(normalizeUrl(url)!), false, url);
+  }
+});
+
+test('Reddit links are recognised', () => {
+  assert.equal(isRedditLink(normalizeUrl('https://old.reddit.com/r/ai/comments/1abc2d/x/')!), true);
+  assert.equal(isRedditLink(normalizeUrl('https://www.reddit.com/r/ai/')!), true);
+  assert.equal(isRedditLink(normalizeUrl('https://redditstatus.com/incidents/1')!), false);
+});
+
+test('links are found in post text', () => {
+  const text = [
+    'Check [this video](https://youtu.be/45RTkHgR3Gc) and https://example.com/a\\_b_c.',
+    'Wiki: https://en.wikipedia.org/wiki/Claude_(language_model), also (https://example.com/paren).',
+    'Twice: https://example.com/a_b_c and <https://example.com/angle>',
+    'Not links: www.example.com, ftp://example.com/file, example.com/page',
+  ].join('\n');
+  assert.deepEqual(linksInText(text), [
+    'https://youtu.be/45RTkHgR3Gc',
+    'https://example.com/a_b_c',
+    'https://en.wikipedia.org/wiki/Claude_(language_model)',
+    'https://example.com/paren',
+    'https://example.com/angle',
+  ]);
+  assert.deepEqual(linksInText(''), []);
 });
 
 test('post ids get their prefix', () => {

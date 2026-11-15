@@ -44,6 +44,12 @@
         "label": "Remove posts that share a link with a recent post",
         "defaultValue": true
       },
+      "maxTextLinks": {
+        "type": "number",
+        "label": "Compare links inside a post's text when it has at most this many",
+        "helpText": "A post with more links than this is treated as a roundup and its links are not compared. Set to 0 to ignore links inside text.",
+        "defaultValue": 5
+      },
       "checkTitles": {
         "type": "boolean",
         "label": "Remove posts that share a title with a recent post",

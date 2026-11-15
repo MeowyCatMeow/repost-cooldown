@@ -11,7 +11,7 @@ Older posts are fine to share again once the cooldown is over.
 ## What counts as a repost
 
 - **Crosspost**: a crosspost of a post from this subreddit, or a plain link to one.
-- **Same link**: the same address, ignoring `http`/`https`, `www.`, tracking parameters and trailing slashes. YouTube, X/Twitter and Reddit links are matched across their different spellings.
+- **Same link**: the same address, ignoring `http`/`https`, `www.`, tracking parameters and trailing slashes. YouTube, X/Twitter and Reddit links are matched across their different spellings. Links written inside a post's text count too, unless the post has more than five of them or they point at Reddit. A site's front page, such as `youtube.com`, is never compared.
 - **Same title**: the same words, ignoring capitals, punctuation, emoji and spacing.
 - **Same text**: a text post whose body has the same words as an earlier one, compared the same way, even under a different title.
 
@@ -36,6 +36,7 @@ Moderators can change these from the app's settings page in the subreddit:
 | Cooldown (days) | 30 |
 | Remove crossposts of posts from this subreddit | on |
 | Remove posts that share a link with a recent post | on |
+| Compare links inside a post's text when it has at most this many | 5 |
 | Remove posts that share a title with a recent post | on |
 | Shortest title to compare (letters and digits) | 12 |
 | Remove text posts that repeat the text of a recent post | on |

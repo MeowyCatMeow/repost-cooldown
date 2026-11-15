@@ -134,7 +134,7 @@ export function normalizeUrl(raw: string): string | undefined {
   if (videoId) return `youtube.com/watch?v=${videoId}`;
 
   if (TWITTER_HOSTS.has(host)) {
-    return `x.com/${segments.join('/').toLowerCase()}`;
+    return segments.length ? `x.com/${segments.join('/').toLowerCase()}` : 'x.com';
   }
 
   const params = [...url.searchParams.entries()]
@@ -145,4 +145,36 @@ export function normalizeUrl(raw: string): string | undefined {
   const port = url.port ? `:${url.port}` : '';
   const path = segments.length ? `/${segments.join('/')}` : '';
   return `${host}${port}${path}${params ? `?${params}` : ''}`;
+}
+
+/**
+ * True when a normalized link is only a site's front page, such as
+ * `youtube.com`. Front pages say nothing about what was shared.
+ */
+export function isHomepage(normalizedUrl: string): boolean {
+  return !normalizedUrl.includes('/') && !normalizedUrl.includes('?');
+}
+
+/** True when a normalized link points at Reddit itself (a post, a subreddit, a user). */
+export function isRedditLink(normalizedUrl: string): boolean {
+  return normalizedUrl === 'reddit.com' || normalizedUrl.startsWith('reddit.com/') || normalizedUrl.startsWith('redd.it/');
+}
+
+/** The web addresses written in a post's text, in order, as written. */
+export function linksInText(text: string): string[] {
+  const found = decodeEntities(text ?? '').match(/https?:\/\/[^\s<>"'[\]]+/gi) ?? [];
+  const links: string[] = [];
+  for (const raw of found) {
+    // Reddit's Markdown escapes some characters in addresses with a backslash.
+    let link = raw.replaceAll('\\', '');
+    // Drop what belongs to the sentence or the Markdown around the address.
+    for (;;) {
+      const last = link.at(-1) ?? '';
+      const unbalanced = last === ')' && link.split(')').length > link.split('(').length;
+      if ('.,;:!?*_~'.includes(last) || unbalanced) link = link.slice(0, -1);
+      else break;
+    }
+    if (link && !links.includes(link)) links.push(link);
+  }
+  return links;
 }

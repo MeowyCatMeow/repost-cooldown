@@ -273,6 +273,63 @@ test('existing posts are recorded by their text too', async () => {
   assert.deepEqual(repeat.outcome, { action: 'removed', reason: 'text', originalId: old.id });
 });
 
+const VIDEO = 'https://www.youtube.com/watch?v=45RTkHgR3Gc';
+
+test('a front page link is never a repost', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'My favourite site for tutorials', url: 'https://www.youtube.com/' });
+  assert.deepEqual(first.outcome, { action: 'indexed', compared: ['title'] });
+  const second = await w.submit({ title: 'Where I learn most things now', url: 'http://youtube.com?utm_source=share' });
+  assert.equal(second.outcome.action, 'indexed');
+
+  // The same video is still a repost.
+  await w.submit({ title: 'Watch this one before the weekend', url: VIDEO });
+  const repeat = await w.submit({ title: 'Great talk, worth the full hour', url: 'https://youtu.be/45RTkHgR3Gc?t=30' });
+  assert.equal(repeat.outcome.action, 'removed');
+});
+
+test('a link inside post text matches an earlier link post', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Watch this one before the weekend', url: VIDEO });
+  w.advance(2);
+  const second = await w.submit({
+    title: 'Has anyone else seen this talk',
+    body: 'I found this and thought of you all: [the talk](https://youtu.be/45RTkHgR3Gc). Thoughts?',
+    isSelf: true,
+  });
+  assert.deepEqual(second.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+  assert.match(w.comments[0]!.text, /shares a link/);
+});
+
+test('two text posts that mention the same link match, and a later link post matches them', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}.`, isSelf: true });
+  const second = await w.submit({ title: 'Another angle on the product', body: `Different words, same thing (${VIDEO})`, isSelf: true });
+  assert.deepEqual(second.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+  const third = await w.submit({ title: 'Just the video on its own', url: VIDEO });
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+});
+
+test('text links to Reddit and to front pages are not compared', async () => {
+  const w = new World();
+  const body = 'Following up on https://www.reddit.com/r/home/comments/abc123/earlier_thread/ and see https://openai.com/ too.';
+  await w.submit({ title: 'A follow-up to the earlier thread', body, isSelf: true });
+  const second = await w.submit({ title: 'My own follow-up to that thread', body: `${body} Plus my own take on it all.`, isSelf: true });
+  assert.equal(second.outcome.action, 'indexed');
+});
+
+test('a post with many links is a roundup and its links are not compared', async () => {
+  const w = new World();
+  await w.submit({ title: 'Watch this one before the weekend', url: VIDEO });
+  const six = [1, 2, 3, 4, 5].map((n) => `https://example.com/story-${n}`).concat(VIDEO).join('\n\n');
+  const roundup = await w.submit({ title: 'This week in links, issue twelve', body: six, isSelf: true });
+  assert.equal(roundup.outcome.action, 'indexed');
+
+  const off = { ...DEFAULT_SETTINGS, maxTextLinks: 0 };
+  const quiet = await w.submit({ title: 'Mentioning the talk in passing', body: `See ${VIDEO}`, isSelf: true }, off);
+  assert.equal(quiet.outcome.action, 'indexed');
+});
+
 test('each check can be switched off', async () => {
   const w = new World();
   const off = { ...DEFAULT_SETTINGS, checkCrossposts: false, checkLinks: false, checkTitles: false };

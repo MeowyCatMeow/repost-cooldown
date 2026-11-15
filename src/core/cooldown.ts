@@ -11,7 +11,16 @@
  * Every key expires on its own once its post is older than the cooldown.
  */
 import { createHash } from 'node:crypto';
-import { normalizeTitle, normalizeUrl, redditPostIdFromUrl, titleWeight, toPostId } from './normalize.ts';
+import {
+  isHomepage,
+  isRedditLink,
+  linksInText,
+  normalizeTitle,
+  normalizeUrl,
+  redditPostIdFromUrl,
+  titleWeight,
+  toPostId,
+} from './normalize.ts';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -20,6 +29,8 @@ export type Settings = {
   cooldownDays: number;
   checkCrossposts: boolean;
   checkLinks: boolean;
+  /** Links inside a post's text are compared when it has at most this many; 0 turns that off. */
+  maxTextLinks: number;
   checkTitles: boolean;
   minTitleLength: number;
   checkText: boolean;
@@ -39,6 +50,7 @@ export const DEFAULT_SETTINGS: Settings = {
   cooldownDays: 30,
   checkCrossposts: true,
   checkLinks: true,
+  maxTextLinks: 5,
   checkTitles: true,
   minTitleLength: 12,
   checkText: true,
@@ -64,6 +76,7 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     cooldownDays: num('cooldownDays', 1, 365),
     checkCrossposts: bool('checkCrossposts'),
     checkLinks: bool('checkLinks'),
+    maxTextLinks: num('maxTextLinks', 0, 100),
     checkTitles: bool('checkTitles'),
     minTitleLength: num('minTitleLength', 0, 300),
     checkText: bool('checkText'),
@@ -143,7 +156,7 @@ type PostRecord = { at: number; keys: string[] };
 
 const REASON_TEXT: Record<Reason, string> = {
   crosspost: "it is a crosspost of a recent post from this subreddit",
-  link: 'it shares its link with a recent post',
+  link: 'it shares a link with a recent post',
   text: 'it has the same text as a recent post',
   title: 'it has the same title as a recent post',
 };
@@ -173,12 +186,25 @@ export function fingerprintsOf(
   settings: Settings
 ): Fingerprint[] {
   const prints: Fingerprint[] = [];
-  if (settings.checkLinks && !post.isSelf) {
-    const link = normalizeUrl(post.url);
-    // A text post's "link" is its own permalink, which says nothing.
-    if (link && redditPostIdFromUrl(post.url) !== post.id) {
-      prints.push({ kind: 'link', key: `fp:link:${hash(link)}` });
+  if (settings.checkLinks) {
+    const links = new Set<string>();
+    if (!post.isSelf) {
+      const link = normalizeUrl(post.url);
+      // A text post's "link" is its own permalink, which says nothing.
+      if (link && !isHomepage(link) && redditPostIdFromUrl(post.url) !== post.id) links.add(link);
     }
+    if (settings.maxTextLinks > 0 && post.body) {
+      // Links to Reddit inside a post's text are conversation ("as discussed
+      // in this thread"), not shared content, so they are not compared.
+      const inText = new Set<string>();
+      for (const raw of linksInText(post.body)) {
+        const link = normalizeUrl(raw);
+        if (link && !isHomepage(link) && !isRedditLink(link)) inText.add(link);
+      }
+      // A post with many links is a roundup, not a repost of any one of them.
+      if (inText.size <= settings.maxTextLinks) for (const link of inText) links.add(link);
+    }
+    for (const link of links) prints.push({ kind: 'link', key: `fp:link:${hash(link)}` });
   }
   if (settings.checkText) {
     // Compared the same way as titles: capitals, punctuation and spacing are ignored.
@@ -353,7 +379,7 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     if (!match) {
       await indexPost(post, prints, cooldownMs, replaceable, deps);
-      return { action: 'indexed', compared: prints.map((print) => print.kind) };
+      return { action: 'indexed', compared: [...new Set(prints.map((print) => print.kind))] };
     }
 
     if (await isExempt(post, settings, deps)) {
