@@ -126,6 +126,57 @@ test('an edited post is read again', async () => {
   assert.deepEqual(state.removed, []);
 });
 
+/** A moderator action as Reddit reports it. Account type 1 is a person, 3 is an app. */
+const modAction = (action: string, id: string, moderator: { name: string; accountType: number }) =>
+  call('/internal/triggers/mod-action', {
+    type: 'ModAction',
+    action,
+    targetPost: { id },
+    moderator: { id: 't2_moderator', ...moderator },
+  });
+
+test('a post removed by a person still counts; one removed by an app or AutoModerator does not', async () => {
+  const cases = [
+    { title: 'A title removed by a person', remover: { name: 'modmary', accountType: 1 } },
+    { title: 'A title removed by another app', remover: { name: 'flood-assistant', accountType: 3 } },
+    { title: 'A title removed by AutoModerator', remover: { name: 'AutoModerator', accountType: 1 } },
+  ];
+  const originals: string[] = [];
+  for (const [index, { title, remover }] of cases.entries()) {
+    const original = post({ title, url: `https://i.redd.it/original${index}.png` });
+    await submit(original.event);
+    state.posts.get(original.id)!.removed = true;
+    assert.equal((await modAction('removelink', original.id, remover)).status, 200);
+    originals.push(original.id);
+  }
+
+  const reposts: string[] = [];
+  for (const [index, { title }] of cases.entries()) {
+    const repost = post({ title, url: `https://i.redd.it/repost${index}.png`, author: 'bob' });
+    await submit(repost.event);
+    reposts.push(repost.id);
+  }
+  assert.deepEqual(state.removed, [reposts[0]]);
+  assert.match(state.comments[0]!.text, /that the moderators of r\/home removed/);
+
+  // Approving the removed post makes it an ordinary post again.
+  state.posts.get(originals[0]!)!.removed = false;
+  assert.equal(state.redis.has(`removed:${originals[0]}`), true);
+  await modAction('approvelink', originals[0]!, cases[0]!.remover);
+  assert.equal(state.redis.has(`removed:${originals[0]}`), false);
+});
+
+test('only the author deleting a post frees it at once', async () => {
+  const original = post({ title: 'A title that will be deleted', url: 'https://i.redd.it/deleted.png' });
+  await submit(original.event);
+  const record = `post:${original.id}`;
+  // Reddit reports a removal by a moderator as a delete too; that frees nothing.
+  await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 3 });
+  assert.equal(state.redis.has(record), true);
+  await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 1 });
+  assert.equal(state.redis.has(record), false);
+});
+
 test('installing records recent posts and stops reading at the cooldown', async () => {
   const now = Date.now();
   const recent = post({ title: 'A title from ten days ago here', url: 'https://i.redd.it/ten.png', createdAt: now - 10 * DAY });
@@ -160,7 +211,11 @@ test('the rescan menu item answers with a count, even when the settings cannot b
 test('events without a post, and unknown paths, change nothing', async () => {
   assert.equal((await submit({})).status, 200);
   assert.equal((await call('/internal/triggers/post-update', { type: 'PostUpdate' })).status, 200);
-  assert.equal((await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: 't3_unknown' })).status, 200);
+  assert.equal((await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: 't3_unknown', source: 1 })).status, 200);
+  assert.equal((await call('/internal/triggers/mod-action', { type: 'ModAction', action: 'removelink' })).status, 200);
+  const stranger = { id: 't2_moderator', name: 'modmary', accountType: 1 };
+  const unknown = { type: 'ModAction', action: 'removelink', targetPost: { id: 't3_unknown' }, moderator: stranger };
+  assert.equal((await call('/internal/triggers/mod-action', unknown)).status, 200);
   assert.equal((await call('/internal/nothing-here')).status, 404);
   assert.deepEqual(state.removed, []);
   assert.equal(state.redis.size, 0);

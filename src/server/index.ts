@@ -1,13 +1,14 @@
 /**
  * Devvit entry point. Reddit calls these endpoints (declared in devvit.json)
- * when a post is submitted, edited or deleted, when the app is installed or
- * updated, and when a moderator picks the rescan menu item. The rules live in
- * ../core/cooldown.ts.
+ * when a post is submitted, edited or deleted, when a moderator removes or
+ * approves one, when the app is installed or updated, and when a moderator
+ * picks the rescan menu item. The rules live in ../core/cooldown.ts.
  */
 import type { IncomingMessage } from 'node:http';
 import { context, createServer, getServerPort, reddit, redis, settings } from '@devvit/web/server';
 import type {
   MenuItemRequest,
+  OnModActionRequest,
   OnPostDeleteRequest,
   OnPostSubmitRequest,
   OnPostUpdateRequest,
@@ -15,8 +16,10 @@ import type {
 } from '@devvit/web/shared';
 import {
   handleNewPost,
+  handlePostApproved,
   handlePostDeleted,
   handlePostEdited,
+  handlePostRemovedByModerator,
   indexExistingPosts,
   parseSettings,
   toMillis,
@@ -30,6 +33,15 @@ import { toPostId } from '../core/normalize.ts';
 type PostId = `t3_${string}`;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** How Reddit's events say "deleted by its author" and "this account is a person, not an app". */
+const DELETED_BY_AUTHOR = 1;
+const PERSON = 1;
+
+/** True when an event field holds the given value, written as a number or by its name. */
+function holds(value: unknown, number: number, name: string): boolean {
+  return Number(value) === number || value === name;
+}
 
 function log(message: string): void {
   console.log(`[repost-cooldown] ${message}`);
@@ -114,7 +126,8 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   // only: no usernames, links or text from the subreddits that install the app.
   const who = post.id;
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
-    log(`${who}: ${outcome.action} (${outcome.reason} match with ${outcome.originalId})`);
+    const original = outcome.originalRemoved ? `${outcome.originalId}, which a moderator removed` : outcome.originalId;
+    log(`${who}: ${outcome.action} (${outcome.reason} match with ${original})`);
   } else if (outcome.action === 'indexed') {
     const kind = post.isSelf ? 'text post' : 'link post';
     log(
@@ -134,7 +147,38 @@ async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
 }
 
 async function onPostDelete(event: OnPostDeleteRequest): Promise<void> {
+  // Reddit sends this for removals as well. Only a deletion by the author frees
+  // a post at once; a removed post is looked at when something repeats it.
+  if (!holds(event.source, DELETED_BY_AUTHOR, 'USER')) return;
   await handlePostDeleted(event.postId, { store: redis });
+}
+
+/**
+ * A moderator removing a post is a decision about that post, so posting it
+ * again is removed too. Only a person's removal counts: AutoModerator and
+ * other apps often remove a post because of who posted it or how often, and
+ * the same post from someone else, or later, may be fine.
+ */
+async function onModAction(event: OnModActionRequest): Promise<void> {
+  const id = toPostId(event.targetPost?.id);
+  if (!id) return;
+  if (event.action === 'approvelink') {
+    if (await handlePostApproved(id, { store: redis })) log(`${id}: approved, an ordinary post again`);
+    return;
+  }
+  if (event.action !== 'removelink' && event.action !== 'spamlink') return;
+
+  const name = (event.moderator?.name ?? '').toLowerCase();
+  // The app's own removals are reposts, which were never originals.
+  if (name === context.appSlug.toLowerCase()) return;
+  const accountType = event.moderator?.accountType;
+  if (!holds(accountType, PERSON, 'ACCOUNT_TYPE_USER') || name === 'automoderator') {
+    log(`${id}: removed by AutoModerator or an app (account type ${String(accountType)}), not counted`);
+    return;
+  }
+  if (await handlePostRemovedByModerator(id, { store: redis, now: () => Date.now() })) {
+    log(`${id}: removed by a moderator, so posting it again is removed too`);
+  }
 }
 
 /** Reads the subreddit's newest posts (Reddit lists at most 1000) and records them. */
@@ -184,6 +228,9 @@ async function route(req: IncomingMessage): Promise<object | undefined> {
       return {};
     case '/internal/triggers/post-delete':
       await onPostDelete(await readJson<OnPostDeleteRequest>(req));
+      return {};
+    case '/internal/triggers/mod-action':
+      await onModAction(await readJson<OnModActionRequest>(req));
       return {};
     case '/internal/triggers/app-install':
     case '/internal/triggers/app-upgrade': {

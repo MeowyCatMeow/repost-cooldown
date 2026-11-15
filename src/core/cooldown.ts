@@ -9,7 +9,9 @@
  *   fp:text:<hash>   -> {"id","at"}    the post that currently owns this body text
  *   post:<id>        -> {"at","keys"}  a known post and the fingerprints it owns
  *   seen:<id>        -> a token        the post's submit event is being, or was, handled
- * Every key expires on its own once its post is older than the cooldown.
+ *   removed:<id>     -> "1"            a moderator took the post down; it still counts as an original
+ * Every key expires on its own once its post is older than the cooldown; a
+ * "removed" mark expires once its post is older than the longest cooldown.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -25,9 +27,13 @@ import {
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
+/** The longest cooldown a subreddit can set. */
+const MAX_COOLDOWN_DAYS = 365;
 
 export type Settings = {
   cooldownDays: number;
+  /** A post that a moderator removed still counts as an original. */
+  checkRemovedPosts: boolean;
   checkCrossposts: boolean;
   checkLinks: boolean;
   /** Links inside a post's text are compared when it has at most this many; 0 turns that off. */
@@ -39,6 +45,8 @@ export type Settings = {
   exemptModerators: boolean;
   leaveComment: boolean;
   removalMessage: string;
+  /** The comment left when the original is a post that a moderator removed. */
+  removedOriginalMessage: string;
 };
 
 export const DEFAULT_REMOVAL_MESSAGE =
@@ -47,8 +55,16 @@ export const DEFAULT_REMOVAL_MESSAGE =
   '*I am a bot. If you think this was a mistake, please ' +
   '[message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*';
 
+export const DEFAULT_REMOVED_ORIGINAL_MESSAGE =
+  'Hi u/{author}, your post was removed because it repeats [an earlier post]({original}) ' +
+  'that the moderators of r/{subreddit} removed.\n\n' +
+  'Please do not post it again.\n\n' +
+  '*I am a bot. If you think this was a mistake, please ' +
+  '[message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*';
+
 export const DEFAULT_SETTINGS: Settings = {
   cooldownDays: 30,
+  checkRemovedPosts: true,
   checkCrossposts: true,
   checkLinks: true,
   maxTextLinks: 5,
@@ -59,6 +75,7 @@ export const DEFAULT_SETTINGS: Settings = {
   exemptModerators: true,
   leaveComment: true,
   removalMessage: DEFAULT_REMOVAL_MESSAGE,
+  removedOriginalMessage: DEFAULT_REMOVED_ORIGINAL_MESSAGE,
 };
 
 /** Turns the raw values of the app's settings form into `Settings`. */
@@ -72,9 +89,13 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     if (raw?.[name] == null || raw[name] === '' || !Number.isFinite(value)) return DEFAULT_SETTINGS[name] as number;
     return Math.min(max, Math.max(min, value));
   };
-  const message = raw?.removalMessage;
+  const text = (name: 'removalMessage' | 'removedOriginalMessage'): string => {
+    const value = raw?.[name];
+    return typeof value === 'string' && value.trim() ? value : DEFAULT_SETTINGS[name];
+  };
   return {
-    cooldownDays: num('cooldownDays', 1, 365),
+    cooldownDays: num('cooldownDays', 1, MAX_COOLDOWN_DAYS),
+    checkRemovedPosts: bool('checkRemovedPosts'),
     checkCrossposts: bool('checkCrossposts'),
     checkLinks: bool('checkLinks'),
     maxTextLinks: num('maxTextLinks', 0, 100),
@@ -84,7 +105,8 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     minTextLength: num('minTextLength', 0, 40000),
     exemptModerators: bool('exemptModerators'),
     leaveComment: bool('leaveComment'),
-    removalMessage: typeof message === 'string' && message.trim() ? message : DEFAULT_REMOVAL_MESSAGE,
+    removalMessage: text('removalMessage'),
+    removedOriginalMessage: text('removedOriginalMessage'),
   };
 }
 
@@ -146,11 +168,12 @@ export type Reason = 'crosspost' | 'link' | 'text' | 'title';
 
 export type Fingerprint = { kind: 'link' | 'text' | 'title'; key: string };
 
+/** `originalRemoved` is set when the original is a post that a moderator took down. */
 export type Outcome =
   | { action: 'duplicate-event' }
   | { action: 'indexed'; compared: Array<Fingerprint['kind']> }
-  | { action: 'exempt'; reason: Reason; originalId: string }
-  | { action: 'removed'; reason: Reason; originalId: string };
+  | { action: 'exempt'; reason: Reason; originalId: string; originalRemoved?: true }
+  | { action: 'removed'; reason: Reason; originalId: string; originalRemoved?: true };
 
 type Entry = { id: string; at: number };
 type PostRecord = { at: number; keys: string[] };
@@ -386,6 +409,8 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     const replaceable = new Set<string>();
     let match: Candidate | undefined;
+    /** The original is a post that a moderator took down. */
+    let originalRemoved = false;
     for (const candidate of candidates) {
       if (candidate.id === post.id) continue;
       // With the crosspost check switched off, crossposts are allowed: one is
@@ -397,11 +422,18 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
         continue;
       }
       if (age < 0) continue;
-      // Only a post that is still up counts as an original. When that cannot
+      // A post that is still up counts as an original, and so does one that a
+      // moderator took down, when the subreddit wants that. When neither can
       // be confirmed, leave the new post alone rather than remove it on a guess.
       const info = await getInfo(candidate.id);
       if (!info) continue;
       if (info.removed) {
+        if (settings.checkRemovedPosts && (await store.get(`removed:${candidate.id}`))) {
+          match = candidate;
+          originalRemoved = true;
+          break;
+        }
+        // Deleted by its author, or removed by AutoModerator, Reddit or another app: free again.
         if (candidate.key) replaceable.add(candidate.key);
         continue;
       }
@@ -413,17 +445,19 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
       await indexPost(post, prints, cooldownMs, replaceable, deps);
       return { action: 'indexed', compared: [...new Set(prints.map((print) => print.kind))] };
     }
+    const found = { reason: match.reason, originalId: match.id, ...(originalRemoved ? { originalRemoved: true as const } : {}) };
 
     if (await isExempt(post, settings, deps)) {
       await indexPost(post, prints, cooldownMs, replaceable, deps);
-      return { action: 'exempt', reason: match.reason, originalId: match.id };
+      return { action: 'exempt', ...found };
     }
 
     await reddit.remove(post.id);
 
     const ageMs = post.createdAt - match.at;
     if (settings.leaveComment) {
-      const text = renderRemovalMessage(settings.removalMessage, {
+      const template = originalRemoved ? settings.removedOriginalMessage : settings.removalMessage;
+      const text = renderRemovalMessage(template, {
         author: post.authorName,
         reason: match.reason,
         original: permalinkOf(infoCache.get(match.id), match.id),
@@ -440,11 +474,12 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
     try {
       // Mod notes are limited to 100 characters.
       const what = match.reason === 'crosspost' ? 'crosspost of' : `same ${match.reason} as`;
-      await reddit.addRemovalNote(post.id, `Repost Cooldown: ${what} ${match.id}, made ${formatAge(ageMs)}`);
+      const which = originalRemoved ? `${match.id} (removed by a mod)` : match.id;
+      await reddit.addRemovalNote(post.id, `Repost Cooldown: ${what} ${which}, made ${formatAge(ageMs)}`);
     } catch (error) {
       deps.log?.(`removed ${post.id} but could not add a removal note: ${String(error)}`);
     }
-    return { action: 'removed', reason: match.reason, originalId: match.id };
+    return { action: 'removed', ...found };
   } catch (error) {
     // Let a redelivered event try again.
     await store.del(seenKey);
@@ -452,10 +487,15 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
   }
 }
 
-/** Forgets a post that was deleted, so its link and title are free again. */
+/**
+ * Forgets a post that its author deleted, so its link and title are free
+ * again. A post that a moderator took down is kept: deleting it afterwards
+ * must not make it postable again.
+ */
 export async function handlePostDeleted(rawId: string, deps: Pick<Deps, 'store'>): Promise<void> {
   const id = toPostId(rawId);
   if (!id) return;
+  if (await deps.store.get(`removed:${id}`)) return;
   const recordKey = `post:${id}`;
   const record = readRecord(await deps.store.get(recordKey));
   if (!record) return;
@@ -476,6 +516,9 @@ export async function handlePostEdited(post: IncomingPost, settings: Settings, d
   // A post the app removed, one past the cooldown, or one it never saw has no record.
   const record = readRecord(await deps.store.get(`post:${post.id}`));
   if (!record) return false;
+  // A post that a moderator took down stays recorded as it was when that
+  // happened: editing it must not make its link or text postable again.
+  if (await deps.store.get(`removed:${post.id}`)) return false;
 
   const prints = fingerprintsOf(post, settings);
   const kept = new Set(prints.map((print) => print.key));
@@ -486,6 +529,37 @@ export async function handlePostEdited(post: IncomingPost, settings: Settings, d
   }
   // The post keeps the age it was recorded with; an edit does not restart its cooldown.
   await indexPost({ ...post, createdAt: record.at }, prints, settings.cooldownDays * DAY_MS, new Set(), deps);
+  return true;
+}
+
+/**
+ * Remembers that a moderator took a post down. From then on the post still
+ * counts as an original, so posting it again is caught, even after its author
+ * deletes or edits it. Returns whether the post is one the app keeps track of.
+ */
+export async function handlePostRemovedByModerator(rawId: string, deps: Pick<Deps, 'store' | 'now'>): Promise<boolean> {
+  const id = toPostId(rawId);
+  if (!id) return false;
+  // A post the app removed itself, one past the cooldown, or one it never saw has no record.
+  const record = readRecord(await deps.store.get(`post:${id}`));
+  if (!record) return false;
+  // The mark outlives the post's record under any cooldown a subreddit can set.
+  const expiresAt = record.at + (MAX_COOLDOWN_DAYS + 1) * DAY_MS;
+  if (expiresAt <= deps.now()) return false;
+  await deps.store.set(`removed:${id}`, '1', { expiration: new Date(expiresAt) });
+  return true;
+}
+
+/**
+ * A moderator approved a post: if it had been taken down, it is an ordinary
+ * post again. Returns whether it had been marked as taken down.
+ */
+export async function handlePostApproved(rawId: string, deps: Pick<Deps, 'store'>): Promise<boolean> {
+  const id = toPostId(rawId);
+  if (!id) return false;
+  const key = `removed:${id}`;
+  if (!(await deps.store.get(key))) return false;
+  await deps.store.del(key);
   return true;
 }
 

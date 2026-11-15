@@ -3,8 +3,10 @@ import { test } from 'node:test';
 import {
   DEFAULT_SETTINGS,
   handleNewPost,
+  handlePostApproved,
   handlePostDeleted,
   handlePostEdited,
+  handlePostRemovedByModerator,
   indexExistingPosts,
   parseSettings,
   type Deps,
@@ -576,6 +578,90 @@ test('an edit never removes a post or takes over what another post owns', async 
 
   // An edit to a post the app is not tracking, such as one it removed, changes nothing.
   assert.equal(await handlePostEdited({ ...third.post, body: 'Edited after removal' }, DEFAULT_SETTINGS, w.deps), false);
+});
+
+/** What happens when a moderator, a person, takes a post down. */
+async function removeAsModerator(w: World, id: string): Promise<boolean> {
+  w.posts.get(id)!.removed = true;
+  return handlePostRemovedByModerator(id, w.deps);
+}
+
+test('a post that a moderator removed still counts as an original', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
+  assert.equal(await removeAsModerator(w, first.post.id), true);
+
+  w.advance(1);
+  const again = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x', authorName: 'bob' });
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id, originalRemoved: true });
+  assert.match(w.comments[0]!.text, /u\/bob/);
+  assert.match(w.comments[0]!.text, /that the moderators of r\/home removed/);
+  assert.match(w.comments[0]!.text, /Please do not post it again/);
+  assert.match(w.notes[0]!, /removed by a mod/);
+  assert.ok(w.notes[0]!.length <= 100);
+
+  // A moderator may still post it.
+  w.moderators.add('modmary');
+  const byMod = await w.submit({ title: 'The very same title twice', authorName: 'modmary' });
+  assert.deepEqual(byMod.outcome, { action: 'exempt', reason: 'title', originalId: first.post.id, originalRemoved: true });
+});
+
+test('deleting or editing a post that a moderator removed does not free it', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
+  await removeAsModerator(w, first.post.id);
+  // Its author edits the link out, and then deletes the post.
+  assert.equal(await handlePostEdited({ ...first.post, body: 'Nothing here now.' }, DEFAULT_SETTINGS, w.deps), false);
+  await handlePostDeleted(first.post.id, w.deps);
+
+  w.advance(1);
+  const again = await w.submit({ title: 'Just the video on its own', url: VIDEO });
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id, originalRemoved: true });
+});
+
+test('a removed post that a moderator approves is an ordinary post again', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice' });
+  await removeAsModerator(w, first.post.id);
+  // The moderator changes their mind.
+  w.posts.get(first.post.id)!.removed = false;
+  assert.equal(await handlePostApproved(first.post.id, w.deps), true);
+  assert.equal(await handlePostApproved(first.post.id, w.deps), false);
+
+  const again = await w.submit({ title: 'The very same title twice' });
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
+  assert.match(w.comments[0]!.text, /can be shared again once 30 days/);
+
+  // Its author can delete it again to free the title.
+  await handlePostDeleted(first.post.id, w.deps);
+  const later = await w.submit({ title: 'The very same title twice' });
+  assert.equal(later.outcome.action, 'indexed');
+});
+
+test('the check for removed posts can be switched off, and it ends with the cooldown', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice' });
+  await removeAsModerator(w, first.post.id);
+  const off = { ...DEFAULT_SETTINGS, checkRemovedPosts: false };
+  const allowed = await w.submit({ title: 'The very same title twice' }, off);
+  assert.equal(allowed.outcome.action, 'indexed');
+
+  const other = await w.submit({ title: 'Another title that is used twice' });
+  await removeAsModerator(w, other.post.id);
+  w.advance(31);
+  const late = await w.submit({ title: 'Another title that is used twice' });
+  assert.equal(late.outcome.action, 'indexed');
+  assert.deepEqual(w.removed, []);
+});
+
+test('a removal is only remembered for a post the app keeps track of', async () => {
+  const w = new World();
+  assert.equal(await handlePostRemovedByModerator('t3_unknown', w.deps), false);
+  // A repost that the app removed was never an original.
+  await w.submit({ title: 'The very same title twice' });
+  const repost = await w.submit({ title: 'The very same title twice' });
+  assert.equal(repost.outcome.action, 'removed');
+  assert.equal(await handlePostRemovedByModerator(repost.post.id, w.deps), false);
 });
 
 test('a failed removal can be retried', async () => {

@@ -19,9 +19,17 @@ A removed post gets a stickied comment that links to the original, and a mod not
 
 When a post is edited, the app reads it again. A link or text that was edited out is free for someone else to post, and an edit never gets a post removed.
 
+## Posts a moderator removed
+
+If a moderator removes a post, it still counts as an original for the rest of its cooldown. Posting it again is removed too, with a comment that says so. Deleting or editing the removed post does not change that. If a moderator approves the post again, it is an ordinary post again.
+
+Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. This covers removals made while the app is installed, and it can be switched off.
+
+## What is left alone
+
 The app does not remove a post when:
 
-- the original has itself been removed or deleted,
+- the original was deleted by its author, or was removed by AutoModerator, Reddit's filters or another app,
 - the author is a moderator (can be switched off), AutoModerator, or the app,
 - it cannot confirm that the original is still up, or cannot check who the author is.
 
@@ -36,6 +44,7 @@ Moderators can change these from the app's settings page in the subreddit:
 | Setting | Default |
 | --- | --- |
 | Cooldown (days) | 30 |
+| Remove reposts of posts that a moderator removed | on |
 | Remove crossposts of posts from this subreddit | on |
 | Remove posts that share a link with a recent post | on |
 | Compare links inside a post's text when it has at most this many | 5 |
@@ -46,6 +55,7 @@ Moderators can change these from the app's settings page in the subreddit:
 | Never remove posts made by moderators | on |
 | Leave a stickied comment explaining the removal | on |
 | Removal comment | editable text |
+| Removal comment when the original was removed by a moderator | editable text |
 
 A shorter cooldown applies at once. A longer one is only certain to cover posts made after the change; older posts may be forgotten at the old limit.
 
