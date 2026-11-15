@@ -6,6 +6,8 @@ When someone crossposts a post from your own subreddit, the app checks how old t
 
 The app also catches regular reposts: if a new post shares the same link, title or text as a post made in your sub within the last 30 days, it's removed.
 
+If a moderator removed the original, posting it again is removed too. If its author deleted it, it can be posted again.
+
 Older posts are fine to share again once the cooldown is over.
 
 ## What counts as a repost
@@ -17,21 +19,34 @@ Older posts are fine to share again once the cooldown is over.
 
 A removed post gets a stickied comment that links to the original, and a mod note saying which post it repeated.
 
+## When the original was removed or deleted
+
+| What happened to the original | Posting it again within the cooldown |
+| --- | --- |
+| A moderator removed it | Removed |
+| A moderator removed it, and its author then deleted or edited it | Removed |
+| A moderator removed it and later approved it | Removed, because the original is up again |
+| Its author deleted it | Allowed |
+| AutoModerator, Reddit's filters or another app removed it | Allowed |
+
+A moderator removes a post for a reason, so the app keeps counting that post as the original until its cooldown is over. The repost gets its own comment, which says that the moderators removed the earlier post.
+
+Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's.
+
+If you remove a post for something its author can fix, such as a missing flair, and they post it again, the app removes the new post. Approve it to let it through.
+
+This covers removals made while the app is installed. It can be switched off in the settings, and then a removed post no longer blocks anything.
+
+## Edited posts
+
 When a post is edited, the app reads it again. A link or text that was edited out is free for someone else to post, and an edit never gets a post removed.
-
-## Posts a moderator removed
-
-If a moderator removes a post, it still counts as an original for the rest of its cooldown. Posting it again is removed too, with a comment that says so. Deleting or editing the removed post does not change that. If a moderator approves the post again, it is an ordinary post again.
-
-Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's. This covers removals made while the app is installed, and it can be switched off.
 
 ## What is left alone
 
 The app does not remove a post when:
 
-- the original was deleted by its author, or was removed by AutoModerator, Reddit's filters or another app,
 - the author is a moderator (can be switched off), AutoModerator, or the app,
-- it cannot confirm that the original is still up, or cannot check who the author is.
+- it cannot confirm what happened to the original, or cannot check who the author is.
 
 Very short titles, such as "Help" or "Question", and very short text are not compared; both lengths are settings. A post like that can still be removed for its link.
 
