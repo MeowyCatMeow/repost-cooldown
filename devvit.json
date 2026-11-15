@@ -12,7 +12,8 @@
   "triggers": {
     "onPostSubmit": "/internal/triggers/post-submit",
     "onPostDelete": "/internal/triggers/post-delete",
-    "onAppInstall": "/internal/triggers/app-install"
+    "onAppInstall": "/internal/triggers/app-install",
+    "onAppUpgrade": "/internal/triggers/app-upgrade"
   },
   "menu": {
     "items": [
@@ -53,6 +54,17 @@
         "label": "Shortest title to compare (letters and digits)",
         "helpText": "Titles shorter than this, such as \"Help\" or \"Question\", are never treated as reposts. Set to 0 to compare every title.",
         "defaultValue": 12
+      },
+      "checkText": {
+        "type": "boolean",
+        "label": "Remove text posts that repeat the text of a recent post",
+        "defaultValue": true
+      },
+      "minTextLength": {
+        "type": "number",
+        "label": "Shortest text to compare (letters and digits)",
+        "helpText": "Post text shorter than this is never treated as a repost. Set to 0 to compare every text.",
+        "defaultValue": 40
       },
       "exemptModerators": {
         "type": "boolean",

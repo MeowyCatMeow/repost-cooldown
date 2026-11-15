@@ -215,6 +215,64 @@ test('text posts with different titles never match on link', async () => {
   assert.equal(b.outcome.action, 'indexed');
 });
 
+const LONG_TEXT =
+  'To the OP! Please, I would like to know if you have any kinds of physical feelings toward the AIs you like.';
+
+test('the same text under a different title is removed', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'To the OP! please! I would like to know', body: LONG_TEXT, isSelf: true });
+  assert.deepEqual(first.outcome, { action: 'indexed', compared: ['text', 'title'] });
+  w.advance(1);
+  const second = await w.submit({
+    title: 'but I love the work he is helping me create',
+    body: `  ${LONG_TEXT.toUpperCase()}\n\n`,
+    isSelf: true,
+    authorName: 'bob',
+  });
+  assert.deepEqual(second.outcome, { action: 'removed', reason: 'text', originalId: first.post.id });
+  assert.match(w.comments[0]!.text, /same text/);
+
+  w.advance(31);
+  const third = await w.submit({ title: 'A third title for the same words', body: LONG_TEXT, isSelf: true });
+  assert.equal(third.outcome.action, 'indexed');
+});
+
+test('different text under different titles is kept', async () => {
+  const w = new World();
+  await w.submit({ title: 'To the OP! please! I would like to know', body: LONG_TEXT, isSelf: true });
+  const second = await w.submit({ title: 'A different question entirely', body: `${LONG_TEXT} And one more thing.`, isSelf: true });
+  assert.equal(second.outcome.action, 'indexed');
+});
+
+test('very short text is not compared, and the text check can be switched off', async () => {
+  const w = new World();
+  await w.submit({ title: 'First title for a short body', body: 'Title says it all.', isSelf: true });
+  const second = await w.submit({ title: 'Second title for a short body', body: 'title says it all', isSelf: true });
+  assert.equal(second.outcome.action, 'indexed');
+
+  const off = { ...DEFAULT_SETTINGS, checkText: false };
+  await w.submit({ title: 'Third title, long body this time', body: LONG_TEXT, isSelf: true }, off);
+  const fourth = await w.submit({ title: 'Fourth title, long body this time', body: LONG_TEXT, isSelf: true }, off);
+  assert.equal(fourth.outcome.action, 'indexed');
+});
+
+test('a text post is never compared by link, whatever address Reddit reports for it', async () => {
+  const w = new World();
+  const shared = 'https://www.reddit.com/r/home/submit';
+  await w.submit({ title: 'First text post with an odd address', url: shared, isSelf: true });
+  const second = await w.submit({ title: 'Second text post with an odd address', url: shared, isSelf: true });
+  assert.deepEqual(second.outcome, { action: 'indexed', compared: ['title'] });
+});
+
+test('existing posts are recorded by their text too', async () => {
+  const w = new World();
+  const old = w.make({ title: 'An earlier title for these words', body: LONG_TEXT });
+  w.advance(2);
+  await indexExistingPosts([old], DEFAULT_SETTINGS, w.deps);
+  const repeat = await w.submit({ title: 'A later title for these words', body: LONG_TEXT, isSelf: true });
+  assert.deepEqual(repeat.outcome, { action: 'removed', reason: 'text', originalId: old.id });
+});
+
 test('each check can be switched off', async () => {
   const w = new World();
   const off = { ...DEFAULT_SETTINGS, checkCrossposts: false, checkLinks: false, checkTitles: false };

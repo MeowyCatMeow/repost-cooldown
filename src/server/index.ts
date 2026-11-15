@@ -80,15 +80,28 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
     id,
     title: event.post.title ?? '',
     url: event.post.url ?? '',
+    body: event.post.selftext ?? '',
+    isSelf: event.post.isSelf === true,
     authorName: event.author?.name ?? '',
     createdAt: toMillis(event.post.createdAt, Date.now()),
     crosspostParentId: event.post.crosspostParentId || undefined,
     subredditId: event.post.subredditId || event.subreddit?.id || context.subredditId,
     subredditName: event.subreddit?.name || context.subredditName,
   };
-  const outcome = await handleNewPost(post, await loadSettings(), deps());
+  const current = await loadSettings();
+  const outcome = await handleNewPost(post, current, deps());
+  // One line per post, so the app's log explains every decision.
+  const who = `${post.id} by u/${post.authorName}`;
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
-    log(`${post.id} by u/${post.authorName}: ${outcome.action} (${outcome.reason} match with ${outcome.originalId})`);
+    log(`${who}: ${outcome.action} (${outcome.reason} match with ${outcome.originalId})`);
+  } else if (outcome.action === 'indexed') {
+    const kind = post.isSelf ? 'text post' : `link ${post.url}`;
+    log(
+      `${who}: kept, ${kind}, compared by [${outcome.compared.join(', ') || 'nothing'}], ` +
+        `cooldown ${current.cooldownDays}d, min title ${current.minTitleLength}, min text ${current.minTextLength}`
+    );
+  } else {
+    log(`${who}: event already handled`);
   }
 }
 
@@ -106,6 +119,7 @@ async function rescan(): Promise<number> {
       id: post.id,
       title: post.title,
       url: post.url,
+      body: post.body ?? '',
       authorName: post.authorName,
       createdAt: post.createdAt.getTime(),
       crosspostParentId: post.crosspostParentId,
@@ -131,9 +145,11 @@ async function route(req: IncomingMessage): Promise<object | undefined> {
     case '/internal/triggers/post-delete':
       await onPostDelete(await readJson<OnPostDeleteRequest>(req));
       return {};
-    case '/internal/triggers/app-install': {
+    case '/internal/triggers/app-install':
+    case '/internal/triggers/app-upgrade': {
       const count = await rescan();
-      log(`installed in r/${context.subredditName}; recorded ${count} existing posts`);
+      const what = path.endsWith('app-install') ? 'installed' : 'updated';
+      log(`${what} in r/${context.subredditName}; recorded ${count} existing posts`);
       return {};
     }
     case '/internal/menu/rescan': {

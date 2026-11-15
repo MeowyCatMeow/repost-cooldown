@@ -4,7 +4,7 @@ Repost Cooldown keeps your sub from filling up with the same posts.
 
 When someone crossposts a post from your own subreddit, the app checks how old the original is. If it was posted less than 30 days ago, the crosspost is removed.
 
-The app also catches regular reposts: if a new post shares the same link or title as a post made in your sub within the last 30 days, it's removed.
+The app also catches regular reposts: if a new post shares the same link, title or text as a post made in your sub within the last 30 days, it's removed.
 
 Older posts are fine to share again once the cooldown is over.
 
@@ -13,6 +13,7 @@ Older posts are fine to share again once the cooldown is over.
 - **Crosspost**: a crosspost of a post from this subreddit, or a plain link to one.
 - **Same link**: the same address, ignoring `http`/`https`, `www.`, tracking parameters and trailing slashes. YouTube, X/Twitter and Reddit links are matched across their different spellings.
 - **Same title**: the same words, ignoring capitals, punctuation, emoji and spacing.
+- **Same text**: a text post whose body has the same words as an earlier one, compared the same way, even under a different title.
 
 A removed post gets a stickied comment that links to the original, and a mod note saying which post it repeated.
 
@@ -21,6 +22,7 @@ The app does not remove a post when:
 - the original has itself been removed or deleted,
 - the author is a moderator (can be switched off), AutoModerator, or the app,
 - the title is very short, such as "Help" or "Question" (the length is a setting),
+- the text is very short (the length is a setting),
 - it cannot confirm that the original is still up.
 
 It does not compare images, so the same picture uploaded again under a new title is not caught.
@@ -36,6 +38,8 @@ Moderators can change these from the app's settings page in the subreddit:
 | Remove posts that share a link with a recent post | on |
 | Remove posts that share a title with a recent post | on |
 | Shortest title to compare (letters and digits) | 12 |
+| Remove text posts that repeat the text of a recent post | on |
+| Shortest text to compare (letters and digits) | 40 |
 | Never remove posts made by moderators | on |
 | Leave a stickied comment explaining the removal | on |
 | Removal comment | editable text |

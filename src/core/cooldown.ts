@@ -5,6 +5,7 @@
  * Storage layout (Devvit Redis is already separate per subreddit):
  *   fp:link:<hash>   -> {"id","at"}    the post that currently owns this link
  *   fp:title:<hash>  -> {"id","at"}    the post that currently owns this title
+ *   fp:text:<hash>   -> {"id","at"}    the post that currently owns this body text
  *   post:<id>        -> {"at","keys"}  a known post and the fingerprints it owns
  *   seen:<id>        -> "1"            the post's submit event was already handled
  * Every key expires on its own once its post is older than the cooldown.
@@ -21,6 +22,8 @@ export type Settings = {
   checkLinks: boolean;
   checkTitles: boolean;
   minTitleLength: number;
+  checkText: boolean;
+  minTextLength: number;
   exemptModerators: boolean;
   leaveComment: boolean;
   removalMessage: string;
@@ -38,6 +41,8 @@ export const DEFAULT_SETTINGS: Settings = {
   checkLinks: true,
   checkTitles: true,
   minTitleLength: 12,
+  checkText: true,
+  minTextLength: 40,
   exemptModerators: true,
   leaveComment: true,
   removalMessage: DEFAULT_REMOVAL_MESSAGE,
@@ -61,6 +66,8 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     checkLinks: bool('checkLinks'),
     checkTitles: bool('checkTitles'),
     minTitleLength: num('minTitleLength', 0, 300),
+    checkText: bool('checkText'),
+    minTextLength: num('minTextLength', 0, 40000),
     exemptModerators: bool('exemptModerators'),
     leaveComment: bool('leaveComment'),
     removalMessage: typeof message === 'string' && message.trim() ? message : DEFAULT_REMOVAL_MESSAGE,
@@ -109,6 +116,10 @@ export type IncomingPost = {
   id: string;
   title: string;
   url: string;
+  /** The body of a text post; empty or missing for other kinds of post. */
+  body?: string;
+  /** True for a text post, whose `url` is only its own address. */
+  isSelf?: boolean;
   authorName: string;
   /** Milliseconds since the epoch. */
   createdAt: number;
@@ -117,21 +128,23 @@ export type IncomingPost = {
   subredditName: string;
 };
 
-export type Reason = 'crosspost' | 'link' | 'title';
+export type Reason = 'crosspost' | 'link' | 'text' | 'title';
+
+export type Fingerprint = { kind: 'link' | 'text' | 'title'; key: string };
 
 export type Outcome =
   | { action: 'duplicate-event' }
-  | { action: 'indexed' }
+  | { action: 'indexed'; compared: Array<Fingerprint['kind']> }
   | { action: 'exempt'; reason: Reason; originalId: string }
   | { action: 'removed'; reason: Reason; originalId: string };
 
 type Entry = { id: string; at: number };
 type PostRecord = { at: number; keys: string[] };
-type Fingerprint = { kind: 'link' | 'title'; key: string };
 
 const REASON_TEXT: Record<Reason, string> = {
   crosspost: "it is a crosspost of a recent post from this subreddit",
   link: 'it shares its link with a recent post',
+  text: 'it has the same text as a recent post',
   title: 'it has the same title as a recent post',
 };
 
@@ -154,14 +167,24 @@ export function toMillis(time: number | undefined, fallback: number): number {
   return time < 1e11 ? time * 1000 : time;
 }
 
-/** The link and title keys a post is compared by, honouring the settings. */
-export function fingerprintsOf(post: Pick<IncomingPost, 'id' | 'title' | 'url'>, settings: Settings): Fingerprint[] {
+/** The link, text and title keys a post is compared by, honouring the settings. */
+export function fingerprintsOf(
+  post: Pick<IncomingPost, 'id' | 'title' | 'url' | 'body' | 'isSelf'>,
+  settings: Settings
+): Fingerprint[] {
   const prints: Fingerprint[] = [];
-  if (settings.checkLinks) {
+  if (settings.checkLinks && !post.isSelf) {
     const link = normalizeUrl(post.url);
     // A text post's "link" is its own permalink, which says nothing.
     if (link && redditPostIdFromUrl(post.url) !== post.id) {
       prints.push({ kind: 'link', key: `fp:link:${hash(link)}` });
+    }
+  }
+  if (settings.checkText) {
+    // Compared the same way as titles: capitals, punctuation and spacing are ignored.
+    const text = normalizeTitle(post.body ?? '');
+    if (text && titleWeight(text) >= settings.minTextLength) {
+      prints.push({ kind: 'text', key: `fp:text:${hash(text)}` });
     }
   }
   if (settings.checkTitles) {
@@ -287,7 +310,8 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     if (settings.checkCrossposts) {
       // A plain link to a post is treated like a crosspost of it.
-      const parentId = toPostId(post.crosspostParentId) ?? redditPostIdFromUrl(post.url);
+      const parentId =
+        toPostId(post.crosspostParentId) ?? (post.isSelf ? undefined : redditPostIdFromUrl(post.url));
       if (parentId && parentId !== post.id) {
         const known = parseJson<PostRecord>(await store.get(`post:${parentId}`));
         if (known) {
@@ -329,7 +353,7 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     if (!match) {
       await indexPost(post, prints, cooldownMs, replaceable, deps);
-      return { action: 'indexed' };
+      return { action: 'indexed', compared: prints.map((print) => print.kind) };
     }
 
     if (await isExempt(post, settings, deps)) {
@@ -410,7 +434,8 @@ export async function indexExistingPosts(posts: IncomingPost[], settings: Settin
       writes.push(() => deps.store.set(print.key, value, { nx: true, expiration }));
     }
     const record: PostRecord = { at: post.createdAt, keys: owned };
-    writes.push(() => deps.store.set(`post:${post.id}`, JSON.stringify(record), { nx: true, expiration }));
+    // Rewritten on every pass, so a rescan after an update picks up new kinds of key.
+    writes.push(() => deps.store.set(`post:${post.id}`, JSON.stringify(record), { expiration }));
   }
 
   const BATCH = 25;
