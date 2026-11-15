@@ -1,0 +1,26 @@
+{
+  "private": true,
+  "name": "repost-cooldown",
+  "version": "0.1.0",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/server/index.ts --bundle --platform=node --format=cjs --target=node22 --log-level=warning --outfile=dist/server/index.cjs",
+    "watch": "npm run build -- --watch=forever",
+    "login": "devvit login",
+    "dev": "devvit playtest",
+    "deploy": "devvit upload",
+    "launch": "devvit publish",
+    "type-check": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@devvit/web": "0.15.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "devvit": "0.15.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^6.0.2"
+  }
+}

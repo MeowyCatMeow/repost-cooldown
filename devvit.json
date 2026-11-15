@@ -1,0 +1,79 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "repost-cooldown",
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.cjs"
+  },
+  "permissions": {
+    "reddit": true,
+    "redis": true
+  },
+  "triggers": {
+    "onPostSubmit": "/internal/triggers/post-submit",
+    "onPostDelete": "/internal/triggers/post-delete",
+    "onAppInstall": "/internal/triggers/app-install"
+  },
+  "menu": {
+    "items": [
+      {
+        "label": "Repost Cooldown: rescan recent posts",
+        "description": "Re-reads the subreddit's recent posts so reposts of them are caught.",
+        "forUserType": "moderator",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/rescan"
+      }
+    ]
+  },
+  "settings": {
+    "subreddit": {
+      "cooldownDays": {
+        "type": "number",
+        "label": "Cooldown (days)",
+        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this. Changes apply to posts made from now on.",
+        "defaultValue": 30
+      },
+      "checkCrossposts": {
+        "type": "boolean",
+        "label": "Remove crossposts of posts from this subreddit",
+        "defaultValue": true
+      },
+      "checkLinks": {
+        "type": "boolean",
+        "label": "Remove posts that share a link with a recent post",
+        "defaultValue": true
+      },
+      "checkTitles": {
+        "type": "boolean",
+        "label": "Remove posts that share a title with a recent post",
+        "defaultValue": true
+      },
+      "minTitleLength": {
+        "type": "number",
+        "label": "Shortest title to compare (letters and digits)",
+        "helpText": "Titles shorter than this, such as \"Help\" or \"Question\", are never treated as reposts. Set to 0 to compare every title.",
+        "defaultValue": 12
+      },
+      "exemptModerators": {
+        "type": "boolean",
+        "label": "Never remove posts made by moderators",
+        "defaultValue": true
+      },
+      "leaveComment": {
+        "type": "boolean",
+        "label": "Leave a stickied comment explaining the removal",
+        "defaultValue": true
+      },
+      "removalMessage": {
+        "type": "paragraph",
+        "label": "Removal comment",
+        "helpText": "Placeholders: {author}, {reason}, {original}, {age}, {cooldown}, {subreddit}.",
+        "defaultValue": "Hi u/{author}, your post was removed because {reason}: [the earlier post]({original}), made {age}.\n\nIn r/{subreddit} the same post can be shared again once {cooldown} days have passed since the original.\n\n*I am a bot. If you think this was a mistake, please [message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*"
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build",
+    "dev": "npm run watch"
+  }
+}

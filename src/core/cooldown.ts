@@ -1,0 +1,421 @@
+/**
+ * Repost Cooldown's decision logic. It has no Devvit imports: storage and the
+ * Reddit API are passed in, so the rules can be tested without Reddit.
+ *
+ * Storage layout (Devvit Redis is already separate per subreddit):
+ *   fp:link:<hash>   -> {"id","at"}    the post that currently owns this link
+ *   fp:title:<hash>  -> {"id","at"}    the post that currently owns this title
+ *   post:<id>        -> {"at","keys"}  a known post and the fingerprints it owns
+ *   seen:<id>        -> "1"            the post's submit event was already handled
+ * Every key expires on its own once its post is older than the cooldown.
+ */
+import { createHash } from 'node:crypto';
+import { normalizeTitle, normalizeUrl, redditPostIdFromUrl, titleWeight, toPostId } from './normalize.ts';
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+export type Settings = {
+  cooldownDays: number;
+  checkCrossposts: boolean;
+  checkLinks: boolean;
+  checkTitles: boolean;
+  minTitleLength: number;
+  exemptModerators: boolean;
+  leaveComment: boolean;
+  removalMessage: string;
+};
+
+export const DEFAULT_REMOVAL_MESSAGE =
+  'Hi u/{author}, your post was removed because {reason}: [the earlier post]({original}), made {age}.\n\n' +
+  'In r/{subreddit} the same post can be shared again once {cooldown} days have passed since the original.\n\n' +
+  '*I am a bot. If you think this was a mistake, please ' +
+  '[message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*';
+
+export const DEFAULT_SETTINGS: Settings = {
+  cooldownDays: 30,
+  checkCrossposts: true,
+  checkLinks: true,
+  checkTitles: true,
+  minTitleLength: 12,
+  exemptModerators: true,
+  leaveComment: true,
+  removalMessage: DEFAULT_REMOVAL_MESSAGE,
+};
+
+/** Turns the raw values of the app's settings form into `Settings`. */
+export function parseSettings(raw: Record<string, unknown> | undefined): Settings {
+  const bool = (name: keyof Settings): boolean => {
+    const value = raw?.[name];
+    return typeof value === 'boolean' ? value : (DEFAULT_SETTINGS[name] as boolean);
+  };
+  const num = (name: keyof Settings, min: number, max: number): number => {
+    const value = Number(raw?.[name]);
+    if (raw?.[name] == null || raw[name] === '' || !Number.isFinite(value)) return DEFAULT_SETTINGS[name] as number;
+    return Math.min(max, Math.max(min, value));
+  };
+  const message = raw?.removalMessage;
+  return {
+    cooldownDays: num('cooldownDays', 1, 365),
+    checkCrossposts: bool('checkCrossposts'),
+    checkLinks: bool('checkLinks'),
+    checkTitles: bool('checkTitles'),
+    minTitleLength: num('minTitleLength', 0, 300),
+    exemptModerators: bool('exemptModerators'),
+    leaveComment: bool('leaveComment'),
+    removalMessage: typeof message === 'string' && message.trim() ? message : DEFAULT_REMOVAL_MESSAGE,
+  };
+}
+
+/** The subset of Devvit's Redis client this app uses. */
+export interface Store {
+  get(key: string): Promise<string | undefined | null>;
+  set(key: string, value: string, options?: { nx?: boolean; expiration?: Date }): Promise<unknown>;
+  del(...keys: string[]): Promise<unknown>;
+}
+
+/** What the app needs to know about an existing post. */
+export type PostInfo = {
+  id: string;
+  subredditId: string;
+  /** Milliseconds since the epoch. */
+  createdAt: number;
+  /** Removed, marked as spam, filtered, or deleted by its author. */
+  removed: boolean;
+  permalink?: string;
+};
+
+/** The Reddit calls the app makes. */
+export interface RedditGateway {
+  /** Throws when the post cannot be read. */
+  getPostInfo(id: string): Promise<PostInfo>;
+  isModerator(username: string): Promise<boolean>;
+  remove(id: string): Promise<void>;
+  /** Posts a comment on the post, as a stickied moderator comment. */
+  comment(id: string, text: string): Promise<void>;
+  addRemovalNote(id: string, note: string): Promise<void>;
+}
+
+export type Deps = {
+  store: Store;
+  reddit: RedditGateway;
+  now: () => number;
+  /** Usernames that are never removed, such as the app's own account. */
+  exemptAuthors?: string[];
+  log?: (message: string) => void;
+};
+
+export type IncomingPost = {
+  id: string;
+  title: string;
+  url: string;
+  authorName: string;
+  /** Milliseconds since the epoch. */
+  createdAt: number;
+  crosspostParentId?: string;
+  subredditId: string;
+  subredditName: string;
+};
+
+export type Reason = 'crosspost' | 'link' | 'title';
+
+export type Outcome =
+  | { action: 'duplicate-event' }
+  | { action: 'indexed' }
+  | { action: 'exempt'; reason: Reason; originalId: string }
+  | { action: 'removed'; reason: Reason; originalId: string };
+
+type Entry = { id: string; at: number };
+type PostRecord = { at: number; keys: string[] };
+type Fingerprint = { kind: 'link' | 'title'; key: string };
+
+const REASON_TEXT: Record<Reason, string> = {
+  crosspost: "it is a crosspost of a recent post from this subreddit",
+  link: 'it shares its link with a recent post',
+  title: 'it has the same title as a recent post',
+};
+
+function hash(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 32);
+}
+
+function parseJson<T>(text: string | undefined | null): T | undefined {
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Reddit reports times in seconds in some places and milliseconds in others. */
+export function toMillis(time: number | undefined, fallback: number): number {
+  if (!time || !Number.isFinite(time)) return fallback;
+  return time < 1e11 ? time * 1000 : time;
+}
+
+/** The link and title keys a post is compared by, honouring the settings. */
+export function fingerprintsOf(post: Pick<IncomingPost, 'id' | 'title' | 'url'>, settings: Settings): Fingerprint[] {
+  const prints: Fingerprint[] = [];
+  if (settings.checkLinks) {
+    const link = normalizeUrl(post.url);
+    // A text post's "link" is its own permalink, which says nothing.
+    if (link && redditPostIdFromUrl(post.url) !== post.id) {
+      prints.push({ kind: 'link', key: `fp:link:${hash(link)}` });
+    }
+  }
+  if (settings.checkTitles) {
+    const title = normalizeTitle(post.title);
+    if (title && titleWeight(title) >= settings.minTitleLength) {
+      prints.push({ kind: 'title', key: `fp:title:${hash(title)}` });
+    }
+  }
+  return prints;
+}
+
+export function formatAge(ms: number): string {
+  if (ms < HOUR_MS) return 'less than an hour ago';
+  if (ms < DAY_MS) {
+    const hours = Math.floor(ms / HOUR_MS);
+    return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
+  }
+  const days = Math.floor(ms / DAY_MS);
+  return days === 1 ? '1 day ago' : `${days} days ago`;
+}
+
+export function renderRemovalMessage(
+  template: string,
+  values: { author: string; reason: Reason; original: string; ageMs: number; cooldownDays: number; subreddit: string }
+): string {
+  const fill: Record<string, string> = {
+    author: values.author,
+    reason: REASON_TEXT[values.reason],
+    original: values.original,
+    age: formatAge(values.ageMs),
+    cooldown: String(values.cooldownDays),
+    subreddit: values.subreddit,
+  };
+  return template.replace(/\{(\w+)\}/g, (whole, name: string) => fill[name] ?? whole);
+}
+
+function permalinkOf(info: PostInfo | undefined, id: string): string {
+  const path = info?.permalink;
+  if (path) return path.startsWith('http') ? path : `https://www.reddit.com${path}`;
+  return `https://www.reddit.com/comments/${id.replace(/^t3_/, '')}`;
+}
+
+async function isExempt(post: IncomingPost, settings: Settings, deps: Deps): Promise<boolean> {
+  const author = post.authorName.toLowerCase();
+  if (!author) return false;
+  if (author === 'automoderator') return true;
+  if (deps.exemptAuthors?.some((name) => name.toLowerCase() === author)) return true;
+  if (!settings.exemptModerators) return false;
+  try {
+    return await deps.reddit.isModerator(post.authorName);
+  } catch (error) {
+    deps.log?.(`could not check whether u/${post.authorName} is a moderator: ${String(error)}`);
+    return false;
+  }
+}
+
+/**
+ * Records `post` as the owner of each fingerprint that is free. A fingerprint
+ * in `replaceable` is taken over even though it has an owner, because that
+ * owner is past the cooldown or no longer exists.
+ */
+async function indexPost(
+  post: IncomingPost,
+  prints: Fingerprint[],
+  cooldownMs: number,
+  replaceable: ReadonlySet<string>,
+  deps: Deps
+): Promise<void> {
+  // An hour of slack so a key never disappears just before its cooldown ends.
+  const expiresAt = post.createdAt + cooldownMs + HOUR_MS;
+  if (expiresAt <= deps.now()) return;
+  const expiration = new Date(expiresAt);
+  const value = JSON.stringify({ id: post.id, at: post.createdAt } satisfies Entry);
+
+  const owned: string[] = [];
+  for (const print of prints) {
+    if (replaceable.has(print.key)) {
+      await deps.store.set(print.key, value, { expiration });
+      owned.push(print.key);
+      continue;
+    }
+    // "Set if absent", then read back: only one of two simultaneous posts wins.
+    await deps.store.set(print.key, value, { nx: true, expiration });
+    const current = parseJson<Entry>(await deps.store.get(print.key));
+    if (current?.id === post.id) owned.push(print.key);
+  }
+  const record: PostRecord = { at: post.createdAt, keys: owned };
+  await deps.store.set(`post:${post.id}`, JSON.stringify(record), { expiration });
+}
+
+/**
+ * Handles a newly submitted post: removes it when it repeats a post that is
+ * still inside the cooldown, otherwise remembers it as an original.
+ */
+export async function handleNewPost(post: IncomingPost, settings: Settings, deps: Deps): Promise<Outcome> {
+  const { store, reddit } = deps;
+  const cooldownMs = settings.cooldownDays * DAY_MS;
+
+  // Reddit can deliver the same event more than once.
+  const seenKey = `seen:${post.id}`;
+  if (await store.get(seenKey)) return { action: 'duplicate-event' };
+  await store.set(seenKey, '1', { expiration: new Date(deps.now() + 2 * DAY_MS) });
+
+  try {
+    const prints = fingerprintsOf(post, settings);
+
+    const infoCache = new Map<string, PostInfo | undefined>();
+    const getInfo = async (id: string): Promise<PostInfo | undefined> => {
+      if (!infoCache.has(id)) {
+        let info: PostInfo | undefined;
+        try {
+          info = await reddit.getPostInfo(id);
+        } catch (error) {
+          deps.log?.(`could not read ${id}: ${String(error)}`);
+        }
+        infoCache.set(id, info);
+      }
+      return infoCache.get(id);
+    };
+
+    type Candidate = { reason: Reason; id: string; at: number; key?: string };
+    const candidates: Candidate[] = [];
+
+    if (settings.checkCrossposts) {
+      // A plain link to a post is treated like a crosspost of it.
+      const parentId = toPostId(post.crosspostParentId) ?? redditPostIdFromUrl(post.url);
+      if (parentId && parentId !== post.id) {
+        const known = parseJson<PostRecord>(await store.get(`post:${parentId}`));
+        if (known) {
+          candidates.push({ reason: 'crosspost', id: parentId, at: known.at });
+        } else {
+          const parent = await getInfo(parentId);
+          if (parent && parent.subredditId === post.subredditId) {
+            candidates.push({ reason: 'crosspost', id: parentId, at: parent.createdAt });
+          }
+        }
+      }
+    }
+    for (const print of prints) {
+      const entry = parseJson<Entry>(await store.get(print.key));
+      if (entry) candidates.push({ reason: print.kind, id: entry.id, at: entry.at, key: print.key });
+    }
+
+    const replaceable = new Set<string>();
+    let match: Candidate | undefined;
+    for (const candidate of candidates) {
+      if (candidate.id === post.id) continue;
+      const age = post.createdAt - candidate.at;
+      if (age >= cooldownMs) {
+        if (candidate.key) replaceable.add(candidate.key);
+        continue;
+      }
+      if (age < 0) continue;
+      // Only a post that is still up counts as an original. When that cannot
+      // be confirmed, leave the new post alone rather than remove it on a guess.
+      const info = await getInfo(candidate.id);
+      if (!info) continue;
+      if (info.removed) {
+        if (candidate.key) replaceable.add(candidate.key);
+        continue;
+      }
+      match = candidate;
+      break;
+    }
+
+    if (!match) {
+      await indexPost(post, prints, cooldownMs, replaceable, deps);
+      return { action: 'indexed' };
+    }
+
+    if (await isExempt(post, settings, deps)) {
+      await indexPost(post, prints, cooldownMs, replaceable, deps);
+      return { action: 'exempt', reason: match.reason, originalId: match.id };
+    }
+
+    await reddit.remove(post.id);
+
+    const ageMs = post.createdAt - match.at;
+    if (settings.leaveComment) {
+      const text = renderRemovalMessage(settings.removalMessage, {
+        author: post.authorName,
+        reason: match.reason,
+        original: permalinkOf(infoCache.get(match.id), match.id),
+        ageMs,
+        cooldownDays: settings.cooldownDays,
+        subreddit: post.subredditName,
+      });
+      try {
+        await reddit.comment(post.id, text);
+      } catch (error) {
+        deps.log?.(`removed ${post.id} but could not comment: ${String(error)}`);
+      }
+    }
+    try {
+      // Mod notes are limited to 100 characters.
+      const what = match.reason === 'crosspost' ? 'crosspost of' : `same ${match.reason} as`;
+      await reddit.addRemovalNote(post.id, `Repost Cooldown: ${what} ${match.id}, made ${formatAge(ageMs)}`);
+    } catch (error) {
+      deps.log?.(`removed ${post.id} but could not add a removal note: ${String(error)}`);
+    }
+    return { action: 'removed', reason: match.reason, originalId: match.id };
+  } catch (error) {
+    // Let a redelivered event try again.
+    await store.del(seenKey);
+    throw error;
+  }
+}
+
+/** Forgets a post that was deleted, so its link and title are free again. */
+export async function handlePostDeleted(rawId: string, deps: Pick<Deps, 'store'>): Promise<void> {
+  const id = toPostId(rawId);
+  if (!id) return;
+  const recordKey = `post:${id}`;
+  const record = parseJson<PostRecord>(await deps.store.get(recordKey));
+  if (!record) return;
+  for (const key of record.keys) {
+    const entry = parseJson<Entry>(await deps.store.get(key));
+    if (entry?.id === id) await deps.store.del(key);
+  }
+  await deps.store.del(recordKey);
+}
+
+/**
+ * Remembers posts that already exist (used on install and on a manual
+ * rescan). Nothing is removed. When several of them share a link or title,
+ * the oldest one becomes the original. Returns how many posts were recorded.
+ */
+export async function indexExistingPosts(posts: IncomingPost[], settings: Settings, deps: Deps): Promise<number> {
+  const cooldownMs = settings.cooldownDays * DAY_MS;
+  const now = deps.now();
+  const recent = posts
+    .filter((post) => post.createdAt + cooldownMs > now)
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+  const owner = new Map<string, string>();
+  const writes: Array<() => Promise<unknown>> = [];
+  for (const post of recent) {
+    const expiration = new Date(post.createdAt + cooldownMs + HOUR_MS);
+    const value = JSON.stringify({ id: post.id, at: post.createdAt } satisfies Entry);
+    const owned: string[] = [];
+    for (const print of fingerprintsOf(post, settings)) {
+      if (owner.has(print.key)) continue;
+      owner.set(print.key, post.id);
+      owned.push(print.key);
+      // "Set if absent" keeps whatever the live trigger has already recorded.
+      writes.push(() => deps.store.set(print.key, value, { nx: true, expiration }));
+    }
+    const record: PostRecord = { at: post.createdAt, keys: owned };
+    writes.push(() => deps.store.set(`post:${post.id}`, JSON.stringify(record), { nx: true, expiration }));
+  }
+
+  const BATCH = 25;
+  for (let i = 0; i < writes.length; i += BATCH) {
+    await Promise.all(writes.slice(i, i + BATCH).map((write) => write()));
+  }
+  return recent.length;
+}
