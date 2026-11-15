@@ -53,6 +53,7 @@
       "checkTitles": {
         "type": "boolean",
         "label": "Remove posts that share a title with a recent post",
+        "helpText": "Applies to posts without text, such as images, videos and links. A post with text is only removed when its text matches too.",
         "defaultValue": true
       },
       "minTitleLength": {

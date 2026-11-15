@@ -273,6 +273,36 @@ test('existing posts are recorded by their text too', async () => {
   assert.deepEqual(repeat.outcome, { action: 'removed', reason: 'text', originalId: old.id });
 });
 
+test('the same title over different text is kept', async () => {
+  const w = new World();
+  const title = 'Is Claude down for anyone else right now';
+  await w.submit({ title, body: 'I keep getting errors on every message since this morning.', isSelf: true });
+  w.advance(3);
+  const second = await w.submit({ title, body: 'Started about ten minutes ago for me, on the mobile app only.', isSelf: true });
+  assert.deepEqual(second.outcome, { action: 'indexed', compared: ['text', 'title'] });
+  assert.deepEqual(w.removed, []);
+});
+
+test('the same title over the same short text is removed', async () => {
+  const w = new World();
+  const title = 'Is Claude down for anyone else right now';
+  const first = await w.submit({ title, body: 'See title.', isSelf: true });
+  const second = await w.submit({ title: title.toUpperCase(), body: 'see title', isSelf: true });
+  assert.deepEqual(second.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
+});
+
+test('a title is not shared between a post with text and a post without', async () => {
+  const w = new World();
+  const title = 'Is Claude down for anyone else right now';
+  await w.submit({ title, body: 'I keep getting errors on every message since this morning.', isSelf: true });
+  const image = await w.submit({ title, url: 'https://i.redd.it/screenshot1.png' });
+  assert.equal(image.outcome.action, 'indexed');
+
+  // Two textless posts with one title are still a repost.
+  const again = await w.submit({ title, url: 'https://i.redd.it/screenshot2.png' });
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'title', originalId: image.post.id });
+});
+
 const VIDEO = 'https://www.youtube.com/watch?v=45RTkHgR3Gc';
 
 test('a front page link is never a repost', async () => {

@@ -4,7 +4,8 @@
  *
  * Storage layout (Devvit Redis is already separate per subreddit):
  *   fp:link:<hash>   -> {"id","at"}    the post that currently owns this link
- *   fp:title:<hash>  -> {"id","at"}    the post that currently owns this title
+ *   fp:title-only:<hash> -> {"id","at"} the textless post that currently owns this title
+ *   fp:title-text:<hash> -> {"id","at"} the post that currently owns this title and text
  *   fp:text:<hash>   -> {"id","at"}    the post that currently owns this body text
  *   post:<id>        -> {"at","keys"}  a known post and the fingerprints it owns
  *   seen:<id>        -> "1"            the post's submit event was already handled
@@ -158,7 +159,7 @@ const REASON_TEXT: Record<Reason, string> = {
   crosspost: "it is a crosspost of a recent post from this subreddit",
   link: 'it shares a link with a recent post',
   text: 'it has the same text as a recent post',
-  title: 'it has the same title as a recent post',
+  title: 'it repeats the title of a recent post',
 };
 
 function hash(text: string): string {
@@ -216,7 +217,12 @@ export function fingerprintsOf(
   if (settings.checkTitles) {
     const title = normalizeTitle(post.title);
     if (title && titleWeight(title) >= settings.minTitleLength) {
-      prints.push({ kind: 'title', key: `fp:title:${hash(title)}` });
+      // A title alone only identifies a post that has no text (an image, a
+      // video, a bare link). For a post with text, the text must match too,
+      // so two different posts that happen to share a title are both kept.
+      const text = normalizeTitle(post.body ?? '');
+      const key = text ? `fp:title-text:${hash(`${title}\n${text}`)}` : `fp:title-only:${hash(title)}`;
+      prints.push({ kind: 'title', key });
     }
   }
   return prints;

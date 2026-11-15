@@ -12,7 +12,7 @@ Older posts are fine to share again once the cooldown is over.
 
 - **Crosspost**: a crosspost of a post from this subreddit, or a plain link to one.
 - **Same link**: the same address, ignoring `http`/`https`, `www.`, tracking parameters and trailing slashes. YouTube, X/Twitter and Reddit links are matched across their different spellings. Links written inside a post's text count too, unless the post has more than five of them or they point at Reddit. A site's front page, such as `youtube.com`, is never compared.
-- **Same title**: the same words, ignoring capitals, punctuation, emoji and spacing.
+- **Same title**: the same words, ignoring capitals, punctuation, emoji and spacing. This applies to posts without text, such as images, videos and links. Two posts with text that share a title are only a repost when their text matches too.
 - **Same text**: a text post whose body has the same words as an earlier one, compared the same way, even under a different title.
 
 A removed post gets a stickied comment that links to the original, and a mod note saying which post it repeated.
