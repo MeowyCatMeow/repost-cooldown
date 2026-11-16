@@ -1,8 +1,8 @@
 /**
  * Devvit entry point. Reddit calls these endpoints (declared in devvit.json)
- * when a post is submitted, edited or deleted, when a moderator removes or
- * approves one, when the app is installed or updated, and when a moderator
- * picks the rescan menu item. The rules live in ../core/cooldown.ts.
+ * when a post is submitted, edited, deleted or removed, when a moderator
+ * approves one, when the app is installed or updated, once a day, and when a
+ * moderator picks the rescan menu item. The rules live in ../core/cooldown.ts.
  */
 import type { IncomingMessage } from 'node:http';
 import { context, createServer, getServerPort, reddit, redis, settings } from '@devvit/web/server';
@@ -15,11 +15,12 @@ import type {
   UiResponse,
 } from '@devvit/web/shared';
 import {
+  forgetPost,
+  forgetPosts,
+  forgetUnlisted,
   handleNewPost,
   handlePostApproved,
-  handlePostDeleted,
   handlePostEdited,
-  handlePostRemovedByModerator,
   indexExistingPosts,
   parseSettings,
   toMillis,
@@ -31,20 +32,34 @@ import {
 import { toPostId } from '../core/normalize.ts';
 
 type PostId = `t3_${string}`;
+/** A post as Reddit's API returns it. */
+type RedditPost = Awaited<ReturnType<typeof reddit.getPostById>>;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-/** How Reddit's events say "deleted by its author" and "this account is a person, not an app". */
-const DELETED_BY_AUTHOR = 1;
-const PERSON = 1;
-
-/** True when an event field holds the given value, written as a number or by its name. */
-function holds(value: unknown, number: number, name: string): boolean {
-  return Number(value) === number || value === name;
-}
+/** A post made in the last few minutes may not be in Reddit's list of newest posts yet. */
+const LISTING_LAG_MS = 10 * 60 * 1000;
 
 function log(message: string): void {
   console.log(`[repost-cooldown] ${message}`);
+}
+
+/** True when the post is no longer up: removed, marked as spam, filtered, or deleted by its author. */
+function isGone(post: RedditPost): boolean {
+  return post.removed || post.spam || Boolean(post.removedByCategory) || post.authorName === '[deleted]';
+}
+
+function fromReddit(post: RedditPost): IncomingPost {
+  return {
+    id: post.id,
+    title: post.title,
+    url: post.url,
+    body: post.body ?? '',
+    authorName: post.authorName,
+    createdAt: post.createdAt.getTime(),
+    crosspostParentId: post.crosspostParentId,
+    subredditId: post.subredditId,
+    subredditName: context.subredditName,
+  };
 }
 
 const gateway: RedditGateway = {
@@ -54,10 +69,13 @@ const gateway: RedditGateway = {
       id: post.id,
       subredditId: post.subredditId,
       createdAt: post.createdAt.getTime(),
-      removed:
-        post.removed || post.spam || Boolean(post.removedByCategory) || post.authorName === '[deleted]',
+      removed: isGone(post),
       permalink: post.permalink,
     };
+  },
+  async getPost(id) {
+    const post = await reddit.getPostById(id as PostId);
+    return isGone(post) ? undefined : fromReddit(post);
   },
   async isModerator(username) {
     const found = await reddit.getModerators({ subredditName: context.subredditName, username }).all();
@@ -131,8 +149,9 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   // only: no usernames, links or text from the subreddits that install the app.
   const who = post.id;
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
-    const original = outcome.originalRemoved ? `${outcome.originalId}, which a moderator removed` : outcome.originalId;
-    log(`${who}: ${outcome.action} (${outcome.reason} match with ${original})`);
+    log(`${who}: ${outcome.action} (${outcome.reason} match with ${outcome.originalId})`);
+  } else if (outcome.action === 'gone') {
+    log(`${who}: already deleted or removed, nothing recorded`);
   } else if (outcome.action === 'indexed') {
     const kind = post.isSelf ? 'text post' : 'link post';
     log(
@@ -154,69 +173,74 @@ async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
   if (await handlePostEdited(post, await loadSettings(), deps())) log(`${post.id}: edited, recorded again`);
 }
 
+/**
+ * Reddit sends this when a post is deleted by its author, and when it is
+ * removed by a moderator or by Reddit. Whoever did it, the app must not keep
+ * anything made from the post, so it is erased.
+ */
 async function onPostDelete(event: OnPostDeleteRequest): Promise<void> {
-  // Reddit sends this for removals as well. Only a deletion by the author frees
-  // a post at once; a removed post is looked at when something repeats it.
-  if (!holds(event.source, DELETED_BY_AUTHOR, 'USER')) return;
-  await handlePostDeleted(event.postId, { store: redis });
+  const id = toPostId(event.postId);
+  if (id && (await forgetPost(id, deps()))) log(`${id}: deleted or removed, erased`);
 }
 
-/**
- * A moderator removing a post is a decision about that post, so posting it
- * again is removed too. Only a person's removal counts: AutoModerator and
- * other apps often remove a post because of who posted it or how often, and
- * the same post from someone else, or later, may be fine.
- */
 async function onModAction(event: OnModActionRequest): Promise<void> {
   const id = toPostId(event.targetPost?.id);
   if (!id) return;
   if (event.action === 'approvelink') {
-    const approved = await handlePostApproved(id, deps());
-    if (approved.unmarked) log(`${id}: approved, an ordinary post again`);
+    const approved = await handlePostApproved(id, loadSettings, deps());
     if (approved.commentDeleted) log(`${id}: approved after the app removed it, removal comment deleted`);
+    if (approved.recorded) log(`${id}: approved, recorded again`);
     return;
   }
-  if (event.action !== 'removelink' && event.action !== 'spamlink') return;
-
-  const name = (event.moderator?.name ?? '').toLowerCase();
-  // The app's own removals are reposts, which were never originals.
-  if (name === context.appSlug.toLowerCase()) return;
-  if (!holds(event.moderator?.accountType, PERSON, 'ACCOUNT_TYPE_USER') || name === 'automoderator') return;
-  // A bot that runs under an ordinary account looks like a person; the
-  // moderators can name such accounts in the settings.
-  if ((await loadSettings()).ignoredRemovers.includes(name)) return;
-  if (await handlePostRemovedByModerator(id, { store: redis, now: () => Date.now() })) {
-    log(`${id}: removed by a moderator, so posting it again is removed too`);
+  // A removal usually arrives as a delete event too, but not always, and not
+  // always first. Erasing twice does no harm.
+  if (event.action === 'removelink' || event.action === 'spamlink') {
+    if (await forgetPost(id, deps())) log(`${id}: removed, erased`);
   }
 }
 
-/** Reads the subreddit's newest posts (Reddit lists at most 1000) and records them. */
-async function rescan(): Promise<number> {
-  const subredditName = context.subredditName;
-  // Recording removes nothing, so the defaults are a safe stand-in when the settings cannot be read.
-  const current = await loadSettings().catch((error: unknown) => {
+/** Recording removes nothing, so the defaults are a safe stand-in when the settings cannot be read. */
+async function settingsOrDefaults(): Promise<Settings> {
+  return loadSettings().catch((error: unknown) => {
     log(`could not read the settings, recording with the defaults: ${String(error)}`);
     return parseSettings(undefined);
   });
-  const oldest = Date.now() - current.cooldownDays * DAY_MS;
+}
+
+/**
+ * Reads the subreddit's newest posts (Reddit lists at most 1000), records the
+ * ones that are up, and erases the ones that are not: those the list shows as
+ * removed, and those that are recorded but missing from it, which is how a
+ * post shows that was deleted without the app being told.
+ */
+async function rescan(current: Settings): Promise<{ recorded: number; erased: number }> {
+  const subredditName = context.subredditName;
+  const startedAt = Date.now();
+  const oldest = startedAt - current.cooldownDays * DAY_MS;
   const posts: IncomingPost[] = [];
+  const up = new Set<string>();
+  const gone: string[] = [];
+  // How far back the list was read. Nothing is concluded about older posts.
+  let readBackTo = Infinity;
   // The listing is newest first, so reading stops at the first post that is past the cooldown.
   for await (const post of reddit.getNewPosts({ subredditName, limit: 1000, pageSize: 100 })) {
-    if (post.createdAt.getTime() < oldest) break;
-    if (post.removed || post.spam || post.removedByCategory || post.authorName === '[deleted]') continue;
-    posts.push({
-      id: post.id,
-      title: post.title,
-      url: post.url,
-      body: post.body ?? '',
-      authorName: post.authorName,
-      createdAt: post.createdAt.getTime(),
-      crosspostParentId: post.crosspostParentId,
-      subredditId: post.subredditId,
-      subredditName,
-    });
+    const createdAt = post.createdAt.getTime();
+    if (createdAt < oldest) {
+      readBackTo = oldest;
+      break;
+    }
+    readBackTo = Math.min(readBackTo, createdAt);
+    if (isGone(post)) {
+      gone.push(post.id);
+    } else {
+      posts.push(fromReddit(post));
+      up.add(post.id);
+    }
   }
-  return indexExistingPosts(posts, current, deps());
+  let erased = await forgetPosts(gone, deps());
+  erased += await forgetUnlisted(up, readBackTo, startedAt - LISTING_LAG_MS, deps());
+  const recorded = await indexExistingPosts(posts, current, deps());
+  return { recorded, erased };
 }
 
 async function readJson<T>(req: IncomingMessage): Promise<T> {
@@ -243,16 +267,24 @@ async function route(req: IncomingMessage): Promise<object | undefined> {
       return {};
     case '/internal/triggers/app-install':
     case '/internal/triggers/app-upgrade': {
-      const count = await rescan();
+      const { recorded, erased } = await rescan(await settingsOrDefaults());
       const what = path.endsWith('app-install') ? 'installed' : 'updated';
-      log(`${what} in r/${context.subredditName}; recorded ${count} existing posts`);
+      log(`${what} in r/${context.subredditName}; recorded ${recorded} existing posts, erased ${erased} that are no longer up`);
       return {};
+    }
+    case '/internal/scheduler/daily-check': {
+      // Not every delete and removal event arrives. This catches what was
+      // missed, and reads again the posts that are up. It waits for the next
+      // day rather than run on settings it had to guess.
+      const { recorded, erased } = await rescan(await loadSettings());
+      log(`daily check in r/${context.subredditName}; ${recorded} recent posts are up, erased ${erased} that are not`);
+      return { status: 'ok' };
     }
     case '/internal/menu/rescan': {
       await readJson<MenuItemRequest>(req);
-      const count = await rescan();
+      const { recorded } = await rescan(await settingsOrDefaults());
       const response: UiResponse = {
-        showToast: { text: `Repost Cooldown now knows ${count} recent posts.`, appearance: 'success' },
+        showToast: { text: `Repost Cooldown now knows ${recorded} recent posts.`, appearance: 'success' },
       };
       return response;
     }

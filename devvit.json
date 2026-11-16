@@ -17,6 +17,14 @@
     "onAppInstall": "/internal/triggers/app-install",
     "onAppUpgrade": "/internal/triggers/app-upgrade"
   },
+  "scheduler": {
+    "tasks": {
+      "daily-check": {
+        "endpoint": "/internal/scheduler/daily-check",
+        "cron": "17 4 * * *"
+      }
+    }
+  },
   "menu": {
     "items": [
       {
@@ -33,20 +41,8 @@
       "cooldownDays": {
         "type": "number",
         "label": "Cooldown (days)",
-        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this. A shorter cooldown applies at once; a longer one is only certain to cover posts made after the change.",
+        "helpText": "A repost or same-sub crosspost is removed if the original is newer than this and still up. A shorter cooldown applies at once; a longer one is only certain to cover posts made after the change. A cooldown longer than 30 days is fully applied only if the subreddit gets fewer than 1000 posts in that time; a busier one gets at least 30 days.",
         "defaultValue": 30
-      },
-      "checkRemovedPosts": {
-        "type": "boolean",
-        "label": "Remove reposts of posts that a moderator removed",
-        "helpText": "A post that a moderator removes still counts as an original until its cooldown is over, even if its author then deletes it. Removals by AutoModerator and by other apps are not counted.",
-        "defaultValue": true
-      },
-      "ignoredRemovers": {
-        "type": "string",
-        "label": "Moderator accounts whose removals are not counted",
-        "helpText": "Usernames separated by commas, for bots that run under an ordinary account. AutoModerator and other apps are never counted, so they do not need to be listed.",
-        "defaultValue": ""
       },
       "checkCrossposts": {
         "type": "boolean",
@@ -102,12 +98,6 @@
         "label": "Removal comment",
         "helpText": "Placeholders: {author}, {reason}, {original}, {age}, {cooldown}, {subreddit}.",
         "defaultValue": "Hi u/{author}, your post was removed because {reason}: [the earlier post]({original}), made {age}.\n\nIn r/{subreddit} the same post can be shared again once {cooldown} days have passed since the original.\n\n*I am a bot. If you think this was a mistake, please [message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*"
-      },
-      "removedOriginalMessage": {
-        "type": "paragraph",
-        "label": "Removal comment when the original was removed by a moderator",
-        "helpText": "Used instead of the comment above. The same placeholders work.",
-        "defaultValue": "Hi u/{author}, your post was removed because it repeats [an earlier post]({original}) that the moderators of r/{subreddit} removed.\n\nPlease do not post it again.\n\n*I am a bot. If you think this was a mistake, please [message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*"
       }
     }
   },

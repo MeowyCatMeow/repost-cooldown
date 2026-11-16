@@ -24,6 +24,8 @@ export type FakePost = {
 export const state = {
   server: undefined as Server | undefined,
   redis: new Map<string, { value: string; expiresAt?: number }>(),
+  /** Sorted sets: for each key, its members and their scores. */
+  sorted: new Map<string, Map<string, number>>(),
   posts: new Map<string, FakePost>(),
   moderators: new Set<string>(),
   settings: {} as Record<string, unknown>,
@@ -42,6 +44,7 @@ export const state = {
 /** Puts the fake Reddit and the fake storage back to empty. */
 export function reset(): void {
   state.redis.clear();
+  state.sorted.clear();
   state.posts.clear();
   state.moderators.clear();
   state.settings = {};
@@ -105,6 +108,34 @@ export const redis = {
   },
   async del(...keys: string[]): Promise<void> {
     for (const key of keys) state.redis.delete(key);
+  },
+  async zAdd(key: string, ...members: Array<{ member: string; score: number }>): Promise<number> {
+    const set = state.sorted.get(key) ?? new Map<string, number>();
+    state.sorted.set(key, set);
+    for (const { member, score } of members) set.set(member, score);
+    return members.length;
+  },
+  async zRange(
+    key: string,
+    start: number | string,
+    stop: number | string,
+    options?: { by: 'score' | 'lex' | 'rank' }
+  ): Promise<Array<{ member: string; score: number }>> {
+    if (options?.by !== 'score') throw new Error('this stand-in only ranges by score');
+    return [...(state.sorted.get(key) ?? [])]
+      .filter(([, score]) => score >= Number(start) && score <= Number(stop))
+      .sort((a, b) => a[1] - b[1])
+      .map(([member, score]) => ({ member, score }));
+  },
+  async zRem(key: string, members: string[]): Promise<number> {
+    const set = state.sorted.get(key);
+    return members.filter((member) => set?.delete(member)).length;
+  },
+  async zRemRangeByScore(key: string, min: number, max: number): Promise<number> {
+    const set = state.sorted.get(key);
+    const members = [...(set ?? [])].filter(([, score]) => score >= min && score <= max).map(([member]) => member);
+    for (const member of members) set!.delete(member);
+    return members.length;
   },
 };
 

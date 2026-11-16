@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   DEFAULT_SETTINGS,
+  forgetPost,
+  forgetPosts,
+  forgetUnlisted,
   handleNewPost,
   handlePostApproved,
-  handlePostDeleted,
   handlePostEdited,
-  handlePostRemovedByModerator,
   indexExistingPosts,
   parseSettings,
   type Deps,
@@ -24,7 +25,11 @@ const START = Date.UTC(2026, 0, 1);
 class World {
   time = START;
   data = new Map<string, { value: string; expiresAt?: number }>();
+  /** Sorted sets: for each key, its members and their scores. */
+  sorted = new Map<string, Map<string, number>>();
   posts = new Map<string, PostInfo>();
+  /** What each post says, as Reddit would return it. */
+  contents = new Map<string, IncomingPost>();
   moderators = new Set<string>();
   removed: string[] = [];
   comments: Array<{ id: string; text: string }> = [];
@@ -44,7 +49,29 @@ class World {
     del: async (...keys) => {
       for (const key of keys) this.data.delete(key);
     },
+    zAdd: async (key, ...members) => {
+      const set = this.sorted.get(key) ?? new Map<string, number>();
+      this.sorted.set(key, set);
+      for (const { member, score } of members) set.set(member, score);
+    },
+    zRange: async (key, min, max) =>
+      [...(this.sorted.get(key) ?? [])]
+        .filter(([, score]) => score >= min && score <= max)
+        .sort((a, b) => a[1] - b[1])
+        .map(([member, score]) => ({ member, score })),
+    zRem: async (key, members) => {
+      for (const member of members) this.sorted.get(key)?.delete(member);
+    },
+    zRemRangeByScore: async (key, min, max) => {
+      const set = this.sorted.get(key);
+      for (const [member, score] of [...(set ?? [])]) if (score >= min && score <= max) set!.delete(member);
+    },
   };
+
+  /** The posts the app lists as recorded, oldest first. */
+  listed(): string[] {
+    return [...(this.sorted.get('recorded') ?? [])].sort((a, b) => a[1] - b[1]).map(([member]) => member);
+  }
 
   read(key: string): string | undefined {
     const item = this.data.get(key);
@@ -56,6 +83,16 @@ class World {
     return item.value;
   }
 
+  /** The stored keys that say anything about a post: keys named after it, and values that name it. */
+  about(id: string): string[] {
+    return [...this.data.keys()]
+      .filter((key) => {
+        const value = this.read(key);
+        return value !== undefined && (key.endsWith(`:${id}`) || value.includes(`"${id}"`));
+      })
+      .sort();
+  }
+
   deps: Deps = {
     store: this.store,
     now: () => this.time,
@@ -65,6 +102,11 @@ class World {
         const info = this.posts.get(id);
         if (!info || this.unreadable.has(id)) throw new Error(`cannot read ${id}`);
         return info;
+      },
+      getPost: async (id) => {
+        const info = this.posts.get(id);
+        if (!info || this.unreadable.has(id)) throw new Error(`cannot read ${id}`);
+        return info.removed ? undefined : this.contents.get(id);
       },
       isModerator: async (username) => this.moderators.has(username),
       remove: async (id) => {
@@ -104,7 +146,25 @@ class World {
       ...fields,
     };
     this.posts.set(id, { id, subredditId, createdAt: post.createdAt, removed: false, permalink: `/r/home/comments/${id.slice(3)}/slug/` });
+    this.contents.set(id, post);
     return post;
+  }
+
+  /**
+   * Makes a delete event for `id` get handled in the middle of whatever writes
+   * next: right after the first write to a key that starts with `prefix`.
+   */
+  deleteDuring(id: string, prefix: string): void {
+    const set = this.store.set;
+    let done = false;
+    this.store.set = async (key, value, options) => {
+      const result = await set(key, value, options);
+      if (!done && key.startsWith(prefix)) {
+        done = true;
+        await forgetPost(id, this.deps);
+      }
+      return result;
+    };
   }
 
   /** Creates a post and runs it through the app, as the submit trigger would. */
@@ -405,18 +465,22 @@ test('moderators, AutoModerator and the app itself are not removed', async () =>
   assert.equal(byMod.outcome.action, 'removed');
 });
 
-test('a removed original does not block a new post', async () => {
+test('a removed original does not block a new post, and is erased once that is noticed', async () => {
   const w = new World();
   const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
-  w.posts.get(first.post.id)!.removed = true; // a moderator removed it
+  w.posts.get(first.post.id)!.removed = true; // removed, and the app was never told
   w.advance(1);
-  const second = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
+  const second = await w.submit({ title: 'The very same title twice', url: 'https://example.com/y' });
   assert.equal(second.outcome.action, 'indexed');
+  // All of the first post went, not only the title that was repeated.
+  assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
 
   // The replacement is now the original.
   w.advance(1);
-  const third = await w.submit({ title: 'The very same title twice', url: 'https://example.com/y' });
+  const third = await w.submit({ title: 'The very same title twice', url: 'https://example.com/z' });
   assert.deepEqual(third.outcome, { action: 'removed', reason: 'title', originalId: second.post.id });
+  const fourth = await w.submit({ title: 'Other words for the first link', url: 'https://example.com/x' });
+  assert.equal(fourth.outcome.action, 'indexed');
 });
 
 test('a post the app removed is not treated as an original later', async () => {
@@ -432,16 +496,115 @@ test('a post the app removed is not treated as an original later', async () => {
 test('deleting the original frees its link and title', async () => {
   const w = new World();
   const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
-  await handlePostDeleted(first.post.id, w.deps);
+  assert.equal(await forgetPost(first.post.id, w.deps), true);
   const second = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
   assert.equal(second.outcome.action, 'indexed');
 
   // Deleting a post that owns nothing must not free someone else's keys.
   const third = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
   assert.equal(third.outcome.action, 'removed');
-  await handlePostDeleted(third.post.id, w.deps);
+  assert.equal(await forgetPost(third.post.id, w.deps), false);
   const fourth = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
   assert.equal(fourth.outcome.action, 'removed');
+});
+
+test('a deleted or removed post is erased completely', async () => {
+  const w = new World();
+  const fields = { title: 'First write-up about the product', body: `${LONG_TEXT} ${VIDEO}`, isSelf: true };
+  const first = await w.submit(fields);
+  assert.deepEqual(first.outcome, { action: 'indexed', compared: ['link', 'text', 'title'] });
+  assert.equal(w.about(first.post.id).filter((key) => key.startsWith('fp:')).length, 3);
+
+  assert.equal(await forgetPost(first.post.id, w.deps), true);
+  // What is left says only that there was such a post: no fingerprint and no record.
+  assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
+  assert.deepEqual([...w.data.keys()].filter((key) => key.startsWith('fp:') || key.startsWith('post:')), []);
+  // Erasing it a second time, as when Reddit reports a removal twice, changes nothing.
+  assert.equal(await forgetPost(first.post.id, w.deps), false);
+
+  // The same post can be made again, and is then the original.
+  const second = await w.submit(fields);
+  assert.equal(second.outcome.action, 'indexed');
+  const third = await w.submit(fields);
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'link', originalId: second.post.id });
+});
+
+test('erasing a post leaves alone a fingerprint that a newer post has taken over', async () => {
+  const w = new World();
+  const week = { ...DEFAULT_SETTINGS, cooldownDays: 7 };
+  const first = await w.submit({ title: 'The very same title twice' }, week);
+  w.advance(8);
+  const second = await w.submit({ title: 'The very same title twice' }, week);
+  assert.equal(second.outcome.action, 'indexed');
+  w.time += 1000;
+  await forgetPost(first.post.id, w.deps);
+  const third = await w.submit({ title: 'The very same title twice' }, week);
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'title', originalId: second.post.id });
+});
+
+test('a submit event that arrives after the post is gone records nothing', async () => {
+  const w = new World();
+  const late = w.make({ title: 'The very same title twice', url: 'https://example.com/x' });
+  // Reddit does not promise the order of events: the delete can be handled first.
+  assert.equal(await forgetPost(late.id, w.deps), false);
+  assert.deepEqual(await handleNewPost(late, DEFAULT_SETTINGS, w.deps), { action: 'gone' });
+  assert.deepEqual(w.about(late.id), [`gone:${late.id}`, `seen:${late.id}`]);
+  assert.equal([...w.data.keys()].some((key) => key.startsWith('fp:')), false);
+  // Sending it again changes nothing.
+  assert.equal((await handleNewPost(late, DEFAULT_SETTINGS, w.deps)).action, 'duplicate-event');
+
+  // So it is not an original: the same thing posted afterwards is kept.
+  const next = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
+  assert.equal(next.outcome.action, 'indexed');
+});
+
+test('a repost that a filter is holding back is still removed, but a moderator who posts one is not recorded', async () => {
+  const w = new World();
+  const original = await w.submit({ title: 'The very same title twice' });
+  // The filter's removal is handled before the submit event.
+  const held = w.make({ title: 'The very same title twice', authorName: 'bob' });
+  await forgetPost(held.id, w.deps);
+  assert.deepEqual(await handleNewPost(held, DEFAULT_SETTINGS, w.deps), { action: 'removed', reason: 'title', originalId: original.post.id });
+  assert.deepEqual(w.removed, [held.id]);
+  assert.match(w.comments[0]!.text, /u\/bob/);
+
+  w.moderators.add('modmary');
+  const byMod = w.make({ title: 'The very same title twice', url: 'https://example.com/mod', authorName: 'modmary' });
+  await forgetPost(byMod.id, w.deps);
+  assert.equal((await handleNewPost(byMod, DEFAULT_SETTINGS, w.deps)).action, 'exempt');
+  assert.deepEqual(w.about(byMod.id), [`gone:${byMod.id}`, `seen:${byMod.id}`]);
+});
+
+test('a post deleted while it is being recorded is not kept', async () => {
+  // The delete is handled after the record is written, after the first fingerprint, and after the last.
+  for (const moment of ['post:', 'fp:link:', 'fp:title-text:']) {
+    const w = new World();
+    const post = w.make({ title: 'First write-up about the product', body: `${LONG_TEXT} ${VIDEO}`, isSelf: true });
+    w.deleteDuring(post.id, moment);
+    assert.deepEqual(await handleNewPost(post, DEFAULT_SETTINGS, w.deps), { action: 'gone' }, moment);
+    assert.deepEqual(w.about(post.id), [`gone:${post.id}`, `seen:${post.id}`], moment);
+  }
+});
+
+test('a post deleted while an edit or a rescan is recording it is not kept', async () => {
+  const edited = new World();
+  const first = await edited.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
+  edited.deleteDuring(first.post.id, 'fp:link:');
+  const change = { ...first.post, body: 'Details here: https://example.com/new-page' };
+  assert.equal(await handlePostEdited(change, DEFAULT_SETTINGS, edited.deps), false);
+  assert.deepEqual(edited.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
+
+  const scanned = new World();
+  const stays = scanned.make({ title: 'A post that stays where it is', url: 'https://example.com/stays' });
+  const goes = scanned.make({ title: 'A post that is deleted meanwhile', url: 'https://example.com/goes' });
+  scanned.deleteDuring(goes.id, `post:${goes.id}`);
+  assert.equal(await indexExistingPosts([stays, goes], DEFAULT_SETTINGS, scanned.deps), 1);
+  assert.deepEqual(scanned.about(goes.id), [`gone:${goes.id}`]);
+  assert.equal(scanned.about(stays.id).length, 3);
+
+  // A post that was gone before the rescan began is not recorded by it either.
+  assert.equal(await indexExistingPosts([stays, goes], DEFAULT_SETTINGS, scanned.deps), 1);
+  assert.deepEqual(scanned.about(goes.id), [`gone:${goes.id}`]);
 });
 
 test('when the original cannot be checked, the new post is left alone', async () => {
@@ -548,7 +711,7 @@ test('stored values of an unexpected shape are ignored', async () => {
   w.advance(1);
   const second = await w.submit({ title: 'The very same title twice' });
   assert.equal(second.outcome.action, 'indexed');
-  await handlePostDeleted(first.post.id, w.deps);
+  await forgetPost(first.post.id, w.deps);
   assert.equal(w.data.has(`post:${first.post.id}`), false);
 });
 
@@ -585,115 +748,112 @@ test('an edit never removes a post or takes over what another post owns', async 
   assert.equal(await handlePostEdited({ ...third.post, body: 'Edited after removal' }, DEFAULT_SETTINGS, w.deps), false);
 });
 
-/** What happens when a moderator, a person, takes a post down. */
-async function removeAsModerator(w: World, id: string): Promise<boolean> {
-  w.posts.get(id)!.removed = true;
-  return handlePostRemovedByModerator(id, w.deps);
-}
+const settings = async () => DEFAULT_SETTINGS;
+const settingsNotNeeded = async (): Promise<Settings> => {
+  throw new Error('the settings were asked for');
+};
 
-test('a post that a moderator removed still counts as an original', async () => {
-  const w = new World();
-  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
-  assert.equal(await removeAsModerator(w, first.post.id), true);
-
-  w.advance(1);
-  const again = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x', authorName: 'bob' });
-  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id, originalRemoved: true });
-  assert.match(w.comments[0]!.text, /u\/bob/);
-  assert.match(w.comments[0]!.text, /that the moderators of r\/home removed/);
-  assert.match(w.comments[0]!.text, /Please do not post it again/);
-  assert.match(w.notes[0]!, /removed by a mod/);
-  assert.ok(w.notes[0]!.length <= 100);
-
-  // A moderator may still post it.
-  w.moderators.add('modmary');
-  const byMod = await w.submit({ title: 'The very same title twice', authorName: 'modmary' });
-  assert.deepEqual(byMod.outcome, { action: 'exempt', reason: 'title', originalId: first.post.id, originalRemoved: true });
-});
-
-test('deleting or editing a post that a moderator removed does not free it', async () => {
+test('a post that a moderator removed is erased, even one its author then edits', async () => {
   const w = new World();
   const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
-  await removeAsModerator(w, first.post.id);
-  // Its author edits the link out, and then deletes the post.
-  assert.equal(await handlePostEdited({ ...first.post, body: 'Nothing here now.' }, DEFAULT_SETTINGS, w.deps), false);
-  await handlePostDeleted(first.post.id, w.deps);
+  // A moderator removes it, and Reddit tells the app.
+  w.posts.get(first.post.id)!.removed = true;
+  assert.equal(await forgetPost(first.post.id, w.deps), true);
+  // Its author edits it afterwards: nothing is recorded for a post that is down.
+  assert.equal(await handlePostEdited({ ...first.post, body: `More details: ${VIDEO}` }, DEFAULT_SETTINGS, w.deps), false);
+  assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
 
   w.advance(1);
   const again = await w.submit({ title: 'Just the video on its own', url: VIDEO });
-  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id, originalRemoved: true });
-});
-
-test('a removed post that a moderator approves is an ordinary post again', async () => {
-  const w = new World();
-  const first = await w.submit({ title: 'The very same title twice' });
-  await removeAsModerator(w, first.post.id);
-  // The moderator changes their mind.
-  w.posts.get(first.post.id)!.removed = false;
-  assert.deepEqual(await handlePostApproved(first.post.id, w.deps), { unmarked: true, commentDeleted: false });
-  assert.deepEqual(await handlePostApproved(first.post.id, w.deps), { unmarked: false, commentDeleted: false });
-
-  const again = await w.submit({ title: 'The very same title twice' });
-  assert.deepEqual(again.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
-  assert.match(w.comments[0]!.text, /can be shared again once 30 days/);
-
-  // Its author can delete it again to free the title.
-  await handlePostDeleted(first.post.id, w.deps);
-  const later = await w.submit({ title: 'The very same title twice' });
-  assert.equal(later.outcome.action, 'indexed');
-});
-
-test('the check for removed posts can be switched off, and it ends with the cooldown', async () => {
-  const w = new World();
-  const first = await w.submit({ title: 'The very same title twice' });
-  await removeAsModerator(w, first.post.id);
-  const off = { ...DEFAULT_SETTINGS, checkRemovedPosts: false };
-  const allowed = await w.submit({ title: 'The very same title twice' }, off);
-  assert.equal(allowed.outcome.action, 'indexed');
-
-  const other = await w.submit({ title: 'Another title that is used twice' });
-  await removeAsModerator(w, other.post.id);
-  w.advance(31);
-  const late = await w.submit({ title: 'Another title that is used twice' });
-  assert.equal(late.outcome.action, 'indexed');
+  assert.equal(again.outcome.action, 'indexed');
   assert.deepEqual(w.removed, []);
 });
 
-test('approving a post the app removed deletes the comment that said it was removed', async () => {
+test('a removed post that a moderator approves is recorded again', async () => {
   const w = new World();
-  await w.submit({ title: 'The very same title twice' });
-  const repost = await w.submit({ title: 'The very same title twice' });
-  assert.equal(repost.outcome.action, 'removed');
-  // A moderator decides the repost is fine after all.
-  assert.deepEqual(await handlePostApproved(repost.post.id, w.deps), { unmarked: false, commentDeleted: true });
-  assert.deepEqual(w.deletedComments, ['t1_c1']);
-  assert.deepEqual(await handlePostApproved(repost.post.id, w.deps), { unmarked: false, commentDeleted: false });
-  assert.deepEqual(w.deletedComments, ['t1_c1']);
-});
-
-test('a mark left by a missed approval is dropped once the post is seen to be up', async () => {
-  const w = new World();
-  const first = await w.submit({ title: 'The very same title twice' });
-  await removeAsModerator(w, first.post.id);
-  // It was approved again, but the app never heard about it.
-  w.posts.get(first.post.id)!.removed = false;
-  const second = await w.submit({ title: 'The very same title twice' });
-  assert.deepEqual(second.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
-
-  // Taken down later by something that does not count: it is free again.
+  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
   w.posts.get(first.post.id)!.removed = true;
-  const third = await w.submit({ title: 'The very same title twice' });
-  assert.equal(third.outcome.action, 'indexed');
+  await forgetPost(first.post.id, w.deps);
+
+  // While Reddit still shows it as removed, nothing is recorded.
+  assert.deepEqual(await handlePostApproved(first.post.id, settingsNotNeeded, w.deps), { recorded: false, commentDeleted: false });
+  assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
+
+  w.advance(1);
+  w.posts.get(first.post.id)!.removed = false;
+  assert.deepEqual(await handlePostApproved(first.post.id, settings, w.deps), { recorded: true, commentDeleted: false });
+  assert.equal(w.data.has(`gone:${first.post.id}`), false);
+  // Approving a post that is recorded changes nothing, and does not need the settings.
+  const before = JSON.stringify([...w.data]);
+  assert.deepEqual(await handlePostApproved(first.post.id, settingsNotNeeded, w.deps), { recorded: false, commentDeleted: false });
+  assert.equal(JSON.stringify([...w.data]), before);
+
+  const again = await w.submit({ title: 'Other words for the same link', url: 'https://example.com/x', authorName: 'bob' });
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+  // The cooldown still runs from the day the post was made.
+  assert.match(w.comments[0]!.text, /1 day ago/);
+
+  // Removed again, it is erased again.
+  assert.equal(await forgetPost(first.post.id, w.deps), true);
+  assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
 });
 
-test('a removal is only remembered for a post the app keeps track of', async () => {
+test('approving a post the app removed lets it stay, deletes the comment and records what is free', async () => {
   const w = new World();
-  assert.equal(await handlePostRemovedByModerator('t3_unknown', w.deps), false);
-  // A repost that the app removed was never an original.
-  await w.submit({ title: 'The very same title twice' });
-  const repost = await w.submit({ title: 'The very same title twice' });
+  const original = await w.submit({ title: 'The very same title twice', url: 'https://example.com/a' });
+  const repost = await w.submit({ title: 'The very same title twice', url: 'https://example.com/b' });
   assert.equal(repost.outcome.action, 'removed');
-  assert.equal(await handlePostRemovedByModerator(repost.post.id, w.deps), false);
+  // Reddit reports the app's own removal like any other, and the app erases the repost.
+  assert.equal(await forgetPost(repost.post.id, w.deps), false);
+
+  // A moderator decides the repost is fine after all.
+  w.posts.get(repost.post.id)!.removed = false;
+  assert.deepEqual(await handlePostApproved(repost.post.id, settings, w.deps), { recorded: true, commentDeleted: true });
+  assert.deepEqual(w.deletedComments, ['t1_c1']);
+  assert.deepEqual(await handlePostApproved(repost.post.id, settings, w.deps), { recorded: false, commentDeleted: false });
+  assert.deepEqual(w.deletedComments, ['t1_c1']);
+  assert.deepEqual(w.removed, [repost.post.id]);
+
+  // The title still belongs to the original; the repost's own link is now recorded.
+  const byTitle = await w.submit({ title: 'The very same title twice', url: 'https://example.com/c' });
+  assert.deepEqual(byTitle.outcome, { action: 'removed', reason: 'title', originalId: original.post.id });
+  const byLink = await w.submit({ title: 'Other words for the second link', url: 'https://example.com/b' });
+  assert.deepEqual(byLink.outcome, { action: 'removed', reason: 'link', originalId: repost.post.id });
+});
+
+test('an approved post is never removed, even when its submit event arrives after the approval', async () => {
+  const w = new World();
+  await w.submit({ title: 'The very same title twice' });
+  // Held back by a filter and then approved by a moderator, all before its submit event is handled.
+  const held = w.make({ title: 'The very same title twice' });
+  await forgetPost(held.id, w.deps);
+  assert.deepEqual(await handlePostApproved(held.id, settings, w.deps), { recorded: true, commentDeleted: false });
+  assert.equal((await handleNewPost(held, DEFAULT_SETTINGS, w.deps)).action, 'duplicate-event');
+  assert.deepEqual(w.removed, []);
+});
+
+test('approving a post that is past the cooldown, or that cannot be read, records nothing', async () => {
+  const w = new World();
+  const old = w.make({ title: 'Something from long ago here' });
+  w.advance(31);
+  assert.deepEqual(await handlePostApproved(old.id, settings, w.deps), { recorded: false, commentDeleted: false });
+  assert.equal(w.data.has(`post:${old.id}`), false);
+
+  const hidden = w.make({ title: 'Something that cannot be read' });
+  w.unreadable.add(hidden.id);
+  await assert.rejects(handlePostApproved(hidden.id, settings, w.deps));
+  assert.equal(w.data.has(`post:${hidden.id}`), false);
+});
+
+test('erasing many posts at once counts the ones that were recorded', async () => {
+  const w = new World();
+  const ids: string[] = [];
+  for (let n = 0; n < 30; n++) {
+    ids.push((await w.submit({ title: `A removed post with the number ${n}`, url: `https://example.com/removed-${n}` })).post.id);
+  }
+  const kept = await w.submit({ title: 'A post that is still up today', url: 'https://example.com/up' });
+  assert.equal(await forgetPosts([...ids, 't3_neverseen'], w.deps), 30);
+  assert.deepEqual([...w.data.keys()].filter((key) => key.startsWith('fp:') || key.startsWith('post:')).sort(), w.about(kept.post.id).filter((key) => !key.startsWith('seen:')));
 });
 
 test('a failed removal can be retried', async () => {
@@ -740,6 +900,142 @@ test('existing posts are recorded on install, oldest first, without removing any
   assert.equal(stale.outcome.action, 'indexed');
 });
 
+test('a rescan drops what a post no longer has, and what the settings no longer compare', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
+  // The post was edited and the app never heard about it; a rescan reads it as it is now.
+  const now = { ...first.post, body: 'Details here: https://example.com/new-page' };
+  assert.equal(await indexExistingPosts([now], DEFAULT_SETTINGS, w.deps), 1);
+  const video = await w.submit({ title: 'Just the video on its own', url: VIDEO });
+  assert.equal(video.outcome.action, 'indexed');
+  const page = await w.submit({ title: 'A link to the new page', url: 'https://example.com/new-page' });
+  assert.deepEqual(page.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+
+  // With the link rule switched off, a rescan leaves no link fingerprint behind for that post.
+  const links = () => w.about(first.post.id).filter((key) => key.startsWith('fp:link:'));
+  assert.equal(links().length, 1);
+  await indexExistingPosts([now], { ...DEFAULT_SETTINGS, checkLinks: false }, w.deps);
+  assert.equal(links().length, 0);
+  // So erasing the post later leaves nothing at all.
+  await forgetPost(first.post.id, w.deps);
+  assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
+});
+
+/** The keys that hold a post's record and fingerprints. */
+const recordOf = (w: World, id: string) => w.about(id).filter((key) => key.startsWith('fp:') || key.startsWith('post:'));
+
+test('a recorded post that Reddit no longer lists is erased, as far back as the list was read', async () => {
+  const w = new World();
+  const old = await w.submit({ title: 'A post from before the list begins', url: 'https://example.com/old' });
+  w.advance(5);
+  const deleted = await w.submit({ title: 'A post deleted without a word', url: 'https://example.com/deleted' });
+  const up = await w.submit({ title: 'A post that is still up today', url: 'https://example.com/up' });
+  w.advance(1);
+  const fresh = await w.submit({ title: 'A post made only a moment ago', url: 'https://example.com/fresh' });
+  assert.deepEqual(w.listed(), [old.post.id, deleted.post.id, up.post.id, fresh.post.id]);
+
+  // Reddit's list shows only one of them as up. It was read back to day 3,
+  // and a post made in the last ten minutes may not be in it yet.
+  const erased = await forgetUnlisted(new Set([up.post.id]), START + 3 * DAY, w.time - 10 * 60 * 1000, w.deps);
+  assert.equal(erased, 1);
+  assert.deepEqual(recordOf(w, deleted.post.id), []);
+  assert.equal(w.data.has(`gone:${deleted.post.id}`), true);
+  assert.deepEqual(w.listed(), [old.post.id, up.post.id, fresh.post.id]);
+  for (const kept of [old, up, fresh]) assert.equal(recordOf(w, kept.post.id).length, 3);
+
+  // What was deleted can be posted again.
+  const again = await w.submit({ title: 'A post deleted without a word', url: 'https://example.com/deleted' });
+  assert.equal(again.outcome.action, 'indexed');
+
+  // A list that could not be read says nothing, and erases nothing.
+  assert.equal(await forgetUnlisted(new Set(), Infinity, w.time, w.deps), 0);
+  assert.equal(w.listed().length, 4);
+});
+
+test('the list of recorded posts follows the records', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice' });
+  // A repost that the app removes is never recorded, so it is never listed.
+  const repost = await w.submit({ title: 'The very same title twice' });
+  assert.equal(repost.outcome.action, 'removed');
+  assert.deepEqual(w.listed(), [first.post.id]);
+  await forgetPost(first.post.id, w.deps);
+  assert.deepEqual(w.listed(), []);
+
+  // An entry whose post is past the cooldown is dropped by the next rescan.
+  await w.submit({ title: 'Another title that is used only once' });
+  w.advance(32);
+  const later = w.make({ title: 'A third title that is used only once' });
+  assert.equal(await indexExistingPosts([later], DEFAULT_SETTINGS, w.deps), 1);
+  assert.deepEqual(w.listed(), [later.id]);
+});
+
+const MONTH = 30 * DAY;
+const QUARTER = { ...DEFAULT_SETTINGS, cooldownDays: 90 };
+
+test('nothing is kept for more than 30 days without the post being read again', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' }, QUARTER);
+  assert.ok([...w.data.values()].every((item) => item.expiresAt !== undefined && item.expiresAt <= w.time + MONTH));
+  w.advance(29);
+  const early = await w.submit({ title: 'The very same title twice' }, QUARTER);
+  assert.deepEqual(early.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
+  // The removal comment's id is not kept longer than that either.
+  assert.ok([...w.data.values()].every((item) => item.expiresAt !== undefined && item.expiresAt <= w.time + MONTH));
+
+  // Say the post was deleted and Reddit never told the app. Nothing has read
+  // it since, so after 30 days everything about it is gone anyway.
+  w.advance(2);
+  for (const key of [...w.data.keys()]) await w.store.get(key);
+  assert.deepEqual(w.about(first.post.id), []);
+});
+
+test('a post that is still up is kept through a longer cooldown as long as it is read again', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' }, QUARTER);
+  // The daily pass finds it among the newest posts on day 29...
+  w.advance(29);
+  assert.equal(await indexExistingPosts([first.post], QUARTER, w.deps), 1);
+  // ...so on day 31 it still counts, past the 30 days it was first recorded for.
+  w.advance(2);
+  const second = await w.submit({ title: 'Other words for the same link', url: 'https://example.com/x' }, QUARTER);
+  assert.deepEqual(second.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+
+  for (const day of [50, 70]) {
+    w.time = START + day * DAY;
+    await indexExistingPosts([first.post], QUARTER, w.deps);
+    assert.ok(w.about(first.post.id).every((key) => w.data.get(key)!.expiresAt! <= w.time + MONTH), `day ${day}`);
+  }
+  w.time = START + 85 * DAY;
+  const third = await w.submit({ title: 'The very same title twice' }, QUARTER);
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
+
+  // It is not kept past the cooldown itself.
+  w.time = START + 91 * DAY;
+  for (const key of [...w.data.keys()]) await w.store.get(key);
+  assert.deepEqual(w.about(first.post.id), []);
+  const fourth = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' }, QUARTER);
+  assert.equal(fourth.outcome.action, 'indexed');
+});
+
+test('what an earlier version recorded for longer is cut back to 30 days when the post is read again', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' }, QUARTER);
+  // As an earlier version stored it: good for the whole cooldown, with a mark that the post was removed.
+  for (const key of w.about(first.post.id)) w.data.get(key)!.expiresAt = START + 90 * DAY;
+  w.data.set(`removed:${first.post.id}`, { value: '1', expiresAt: START + 366 * DAY });
+
+  w.advance(1);
+  assert.equal(await indexExistingPosts([first.post], QUARTER, w.deps), 1);
+  const recorded = w.about(first.post.id).filter((key) => key.startsWith('fp:') || key.startsWith('post:'));
+  assert.equal(recorded.length, 3);
+  assert.ok(recorded.every((key) => w.data.get(key)!.expiresAt === w.time + MONTH));
+
+  // And when the post goes, the old mark goes with it.
+  await forgetPost(first.post.id, w.deps);
+  assert.equal(w.data.has(`removed:${first.post.id}`), false);
+});
+
 test('records expire with the cooldown', async () => {
   const w = new World();
   await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
@@ -756,9 +1052,6 @@ test('settings fall back to defaults and are clamped', () => {
   assert.equal(parsed.minTitleLength, DEFAULT_SETTINGS.minTitleLength);
   assert.equal(parsed.removalMessage, DEFAULT_SETTINGS.removalMessage);
   assert.equal(parseSettings({ cooldownDays: 14 }).cooldownDays, 14);
-  assert.deepEqual(parseSettings({ ignoredRemovers: 'u/FloodBot, other_bot  /u/Third,' }).ignoredRemovers, [
-    'floodbot',
-    'other_bot',
-    'third',
-  ]);
+  // Settings that an earlier version had are ignored.
+  assert.deepEqual(parseSettings({ checkRemovedPosts: true, ignoredRemovers: 'u/FloodBot' }), DEFAULT_SETTINGS);
 });
