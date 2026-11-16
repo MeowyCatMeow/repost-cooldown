@@ -32,7 +32,7 @@ A post that the app removes gets a stickied comment that links to the original, 
 | AutoModerator, Reddit's filters or another app removed it | Allowed |
 | A moderator removed it | Allowed, or removed if the option below is on |
 | A moderator removed it and later approved it | Removed, because the original is up again |
-| A moderator removed it, and its author then deleted it | Allowed, with or without the option |
+| A moderator removed it, and its author then deleted it | Allowed, or with the option on, removed until the original's time is up |
 
 ### The option for posts that a moderator removed
 
@@ -42,7 +42,7 @@ With it ticked, a post that a moderator removes keeps counting as the original u
 
 Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's. A bot that runs under an ordinary account looks like a person, so name such accounts in the settings to leave their removals out.
 
-Deleting ends it. Reddit's rules for apps say that an app must forget a post once its author deletes it, and that holds even when a moderator removed the post first. So someone can delete a removed post and post it again, and the app cannot stop that. Reddit does not tell the app when a removed post is deleted; the app finds out when the same thing is posted again, or at its daily check.
+For a post kept this way, the app goes by what Reddit tells it. Reddit tells the app when a moderator approves the post, and the post is an ordinary one again. Reddit does not tell the app when the author of a removed post deletes it, and the app does not go looking. So that post keeps counting until its time is up: the end of its cooldown, and 30 days after the removal at most. This is what stops someone from deleting a removed post only to post it again. If Reddit does send the app a delete event for the post, the app erases it at once.
 
 If you remove a post for something its author can fix, such as a missing flair, and they post it again, the app removes the new post. Approve it to let it through.
 
@@ -67,10 +67,10 @@ How long it keeps them:
 | Is up | Kept until its cooldown ends |
 | Was deleted by its author, or taken down by Reddit | Erased |
 | Was removed by AutoModerator, a filter or another app | Erased |
-| Was removed by a moderator | Erased. With the option ticked: kept until its cooldown ends, a moderator approves it or its author deletes it, and for 30 days at most after the removal |
+| Was removed by a moderator | Erased. With the option ticked: kept until its cooldown ends or a moderator approves it, and for 30 days at most after the removal. If its author deletes it in that time, Reddit does not tell the app, and the fingerprints stay until that time is up |
 | Was edited | What it no longer contains is erased |
 
-Reddit tells the app about most of these as they happen, and the app erases at once. It does not tell the app about all of them. So once a day the app also reads Reddit's list of the subreddit's newest posts and erases whatever it has recorded that should no longer be there. And nothing is kept for more than 30 days after the app last read the post and found it up, which is the limit Reddit recommends.
+Reddit tells the app about most of these as they happen, and the app erases at once. It does not tell the app about all of them. So once a day the app also reads Reddit's list of the subreddit's newest posts and erases whatever it has recorded that should no longer be there. The daily check leaves one kind of post alone: a post that a moderator removed, where the option is ticked. And nothing is kept for more than 30 days after the app last read the post and found it up, which is the limit Reddit recommends.
 
 ### Erasing everything
 

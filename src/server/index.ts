@@ -264,10 +264,12 @@ async function settingsOrDefaults(): Promise<Settings> {
 /**
  * Reads the subreddit's newest posts (Reddit lists at most 1000) and brings
  * what the app has recorded in line with it. Posts that are up are recorded.
- * Removed posts are erased, unless a moderator removed them and the subreddit
- * wants those remembered. And a post that is recorded but missing from the
+ * Removed posts are erased. And a post that is recorded but missing from the
  * list is erased: that is how a post shows that was deleted without the app
  * being told.
+ *
+ * Posts that a moderator removed are the exception, where the subreddit has
+ * that option on: they are left as they are, listed or not.
  */
 async function rescan(current: Settings): Promise<{ recorded: number; erased: number }> {
   const subredditName = context.subredditName;
@@ -302,7 +304,7 @@ async function rescan(current: Settings): Promise<{ recorded: number; erased: nu
   const sorted = await forgetRemoved(removed, current, deps());
   erased += sorted.erased;
   for (const id of sorted.kept) staying.add(id);
-  erased += await forgetUnlisted(staying, readBackTo, startedAt - LISTING_LAG_MS, deps());
+  erased += await forgetUnlisted(staying, readBackTo, startedAt - LISTING_LAG_MS, current, deps());
   const recorded = await indexExistingPosts(posts, current, deps());
   return { recorded, erased };
 }

@@ -829,37 +829,56 @@ test('a post that a moderator removed still counts as an original', async () => 
   assert.deepEqual(byMod.outcome, { action: 'exempt', reason: 'title', originalId: first.post.id, originalRemoved: true });
 });
 
-test('once its author deletes it, a post that a moderator removed is forgotten', async () => {
+test('a post that a moderator removed keeps counting after its author deletes it, until Reddit says so or its time is up', async () => {
   const fields = { title: 'The very same title twice', url: 'https://example.com/x' };
 
-  // Reddit says so with a delete event...
+  // Reddit sends no event when the author of a removed post deletes it, and
+  // the app does not go looking: here, asking Reddit about the post would fail.
+  const untold = new World();
+  const first = await untold.submit(fields);
+  await removeAsModerator(untold, first.post.id);
+  untold.posts.get(first.post.id)!.state = 'deleted';
+  untold.unreadable.add(first.post.id);
+  untold.advance(1);
+  const again = await untold.submit({ ...fields, authorName: 'bob' }, REMEMBER);
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id, originalRemoved: true });
+  assert.match(untold.comments[0]!.text, /that the moderators of r\/home removed/);
+
+  // The daily check leaves it alone too, though Reddit no longer lists it.
+  assert.equal(await forgetUnlisted(new Set(), START, untold.time - 10 * 60 * 1000, REMEMBER, untold.deps), 0);
+  assert.equal(recordOf(untold, first.post.id).length, 3);
+  assert.equal(untold.data.has(`removed:${first.post.id}`), true);
+
+  // It ends when the post's 30 days are up...
+  untold.advance(30);
+  for (const key of [...untold.data.keys()]) await untold.store.get(key);
+  assert.deepEqual(untold.about(first.post.id), []);
+  assert.equal((await untold.submit(fields, REMEMBER)).outcome.action, 'indexed');
+
+  // ...or as soon as Reddit does send a delete event for it...
   const told = new World();
-  const first = await told.submit(fields);
-  await removeAsModerator(told, first.post.id);
-  told.posts.get(first.post.id)!.state = 'deleted';
-  assert.equal(await forgetPost(first.post.id, told.deps), true);
-  assert.deepEqual(told.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
+  const second = await told.submit(fields);
+  await removeAsModerator(told, second.post.id);
+  assert.equal(await forgetPost(second.post.id, told.deps), true);
+  assert.deepEqual(told.about(second.post.id), [`gone:${second.post.id}`, `seen:${second.post.id}`]);
   assert.equal((await told.submit(fields, REMEMBER)).outcome.action, 'indexed');
 
-  // ...or says nothing, as it does for a post that was removed before. Then
-  // the app finds out when the same thing is posted again...
-  const untold = new World();
-  const second = await untold.submit(fields);
-  await removeAsModerator(untold, second.post.id);
-  untold.posts.get(second.post.id)!.state = 'deleted';
-  assert.equal((await untold.submit(fields, REMEMBER)).outcome.action, 'indexed');
-  assert.deepEqual(untold.about(second.post.id), [`gone:${second.post.id}`, `seen:${second.post.id}`]);
-  assert.deepEqual(untold.removed, []);
-
-  // ...or at the daily check, where the deleted post is missing from Reddit's list.
-  const checked = new World();
-  const third = await checked.submit(fields);
-  await removeAsModerator(checked, third.post.id);
-  checked.posts.get(third.post.id)!.state = 'deleted';
-  checked.advance(1);
-  assert.equal(await forgetUnlisted(new Set(), START, checked.time - 10 * 60 * 1000, checked.deps), 1);
-  assert.deepEqual(recordOf(checked, third.post.id), []);
-  assert.equal(checked.data.has(`removed:${third.post.id}`), false);
+  // ...or once the moderators untick the option: then the post is treated
+  // like any other, and one that Reddit no longer lists is erased.
+  const unticked = new World();
+  const third = await unticked.submit(fields);
+  await removeAsModerator(unticked, third.post.id);
+  unticked.posts.get(third.post.id)!.state = 'deleted';
+  unticked.advance(1);
+  assert.equal(await forgetUnlisted(new Set(), START, unticked.time - 10 * 60 * 1000, DEFAULT_SETTINGS, unticked.deps), 1);
+  assert.deepEqual(recordOf(unticked, third.post.id), []);
+  assert.equal(unticked.data.has(`removed:${third.post.id}`), false);
+  // So is one the app comes across when something repeats it.
+  const fourth = await unticked.submit({ title: 'Another title that is used twice' });
+  await removeAsModerator(unticked, fourth.post.id);
+  unticked.posts.get(fourth.post.id)!.state = 'deleted';
+  assert.equal((await unticked.submit({ title: 'Another title that is used twice' })).outcome.action, 'indexed');
+  assert.deepEqual(recordOf(unticked, fourth.post.id), []);
 });
 
 test('the daily check keeps a post that a moderator removed and erases the other removed posts', async () => {
@@ -875,7 +894,7 @@ test('the daily check keeps a post that a moderator removed and erases the other
   const sorted = await forgetRemoved([byMod.post.id, byFilter.post.id], REMEMBER, w.deps);
   assert.deepEqual(sorted, { kept: [byMod.post.id], erased: 1 });
   // Nothing more is erased for being missing from the list.
-  assert.equal(await forgetUnlisted(new Set([up.post.id, ...sorted.kept]), START, w.time - 10 * 60 * 1000, w.deps), 0);
+  assert.equal(await forgetUnlisted(new Set([up.post.id, ...sorted.kept]), START, w.time - 10 * 60 * 1000, REMEMBER, w.deps), 0);
   assert.equal(recordOf(w, byMod.post.id).length, 3);
   assert.deepEqual(recordOf(w, byFilter.post.id), []);
 
@@ -1247,7 +1266,7 @@ test('a recorded post that Reddit no longer lists is erased, as far back as the 
 
   // Reddit's list shows only one of them as up. It was read back to day 3,
   // and a post made in the last ten minutes may not be in it yet.
-  const erased = await forgetUnlisted(new Set([up.post.id]), START + 3 * DAY, w.time - 10 * 60 * 1000, w.deps);
+  const erased = await forgetUnlisted(new Set([up.post.id]), START + 3 * DAY, w.time - 10 * 60 * 1000, DEFAULT_SETTINGS, w.deps);
   assert.equal(erased, 1);
   assert.deepEqual(recordOf(w, deleted.post.id), []);
   assert.equal(w.data.has(`gone:${deleted.post.id}`), true);
@@ -1259,7 +1278,7 @@ test('a recorded post that Reddit no longer lists is erased, as far back as the 
   assert.equal(again.outcome.action, 'indexed');
 
   // A list that could not be read says nothing, and erases nothing.
-  assert.equal(await forgetUnlisted(new Set(), Infinity, w.time, w.deps), 0);
+  assert.equal(await forgetUnlisted(new Set(), Infinity, w.time, DEFAULT_SETTINGS, w.deps), 0);
   assert.equal(w.listed().length, 4);
 });
 

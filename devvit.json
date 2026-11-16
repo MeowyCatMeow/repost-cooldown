@@ -57,7 +57,7 @@
       "checkRemovedPosts": {
         "type": "boolean",
         "label": "Also remove reposts of posts that a moderator removed",
-        "helpText": "Off unless you switch it on. When on: a post that a moderator removes by hand still counts as an original, so posting it again is removed. That lasts until the post's cooldown ends, for 30 days at most, and ends sooner if a moderator approves the post or its author deletes it. Removals by AutoModerator, Reddit and other apps never count.",
+        "helpText": "Off unless you switch it on. When on: a post that a moderator removes by hand still counts as an original, so posting it again is removed. That lasts until the post's cooldown ends, for 30 days at most, and ends sooner if a moderator approves the post. If the post's author deletes it after the removal, Reddit does not tell the app, so the post keeps counting until that time is up. Removals by AutoModerator, Reddit and other apps never count.",
         "defaultValue": false
       },
       "ignoredRemovers": {

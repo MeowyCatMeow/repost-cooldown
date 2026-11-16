@@ -418,7 +418,7 @@ test('the daily check concludes nothing about posts older than Reddit lists', as
   assert.equal(state.sorted.get('recorded')!.size, 1001);
 });
 
-test('the daily check keeps a post that a moderator removed, until its author deletes it', async () => {
+test('a post that a moderator removed keeps counting after its author deletes it, as Reddit sends no event', async () => {
   const hour = 60 * 60 * 1000;
   const original = post({ title: 'A title removed by a person', url: 'https://i.redd.it/original.png', createdAt: Date.now() - 2 * hour });
   await submit(original.event);
@@ -428,13 +428,31 @@ test('the daily check keeps a post that a moderator removed, until its author de
   state.posts.get(original.id)!.removed = true;
   await modAction('removelink', original.id, { name: 'modmary', accountType: 1 });
 
-  // Reddit lists it as removed, and a moderator removed it: it stays.
+  // Reddit lists it as removed, and a moderator removed it: the daily check leaves it.
   assert.equal((await call('/internal/scheduler/daily-check', { name: 'daily-check' })).status, 200);
   assert.equal(kept(original.id).length, 3);
   assert.equal(state.redis.has(`removed:${original.id}`), true);
 
-  // Its author deletes it. Reddit sends no event for that; the post is just no longer in the list.
+  // Its author deletes it. Reddit sends no event for that; the post is just
+  // gone from the list, and can no longer be read. The app does not go looking.
   state.posts.delete(original.id);
+  assert.equal((await call('/internal/scheduler/daily-check', { name: 'daily-check' })).status, 200);
+  assert.equal(kept(original.id).length, 3);
+  const repost = post({ title: 'A title removed by a person', url: 'https://i.redd.it/again.png', author: 'bob' });
+  await submit(repost.event);
+  assert.deepEqual(state.removed, [repost.id]);
+  assert.match(state.comments[0]!.text, /that the moderators of r\/home removed/);
+
+  // If Reddit did send a delete event, the post would be erased at once.
+  const told = post({ title: 'A second title removed by a person', url: 'https://i.redd.it/told.png', createdAt: Date.now() - 2 * hour });
+  await submit(told.event);
+  state.posts.get(told.id)!.removed = true;
+  await modAction('removelink', told.id, { name: 'modmary', accountType: 1 });
+  await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: told.id, source: 1 });
+  assert.deepEqual(kept(told.id), []);
+
+  // And once the moderators untick the option, the next daily check erases it.
+  state.settings = {};
   assert.equal((await call('/internal/scheduler/daily-check', { name: 'daily-check' })).status, 200);
   assert.deepEqual(kept(original.id), []);
   assert.equal(state.redis.has(`removed:${original.id}`), false);

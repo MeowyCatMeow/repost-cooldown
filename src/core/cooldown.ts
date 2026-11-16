@@ -22,11 +22,14 @@
  *   - A post that is up is recorded until its cooldown ends.
  *   - A post that a moderator, a person, removed stays recorded, so that
  *     posting it again is removed too, but only in a subreddit whose
- *     moderators have switched that option on. The post is still on Reddit,
- *     only no longer shown in the subreddit. With the option off, which is
+ *     moderators have switched that option on. With the option off, which is
  *     how it comes, such a post is erased like any other removed post.
- *   - A post that its author deleted, or that Reddit took down, is erased at
- *     once (forgetPost), option or no option. So is one removed by
+ *     For a post kept this way the app goes by what Reddit tells it: an
+ *     approval makes it an ordinary post again, a delete event erases it.
+ *     Reddit sends no event when the author of a removed post deletes it, and
+ *     the app does not go looking, so that post counts until its time is up.
+ *   - A post that its author deleted, or that Reddit took down, is erased as
+ *     soon as the app learns of it (forgetPost). So is one removed by
  *     AutoModerator, a filter or another app.
  *   - An edited post is read again, and what it no longer has is erased.
  *   - Nothing outlives 30 days from the last time the app read the post from
@@ -37,10 +40,11 @@
  * and respect user deletions"; Developer Terms 3.3). Not every event arrives,
  * though. Reddit sends none when a post that was once removed is later deleted
  * by its author, even if a moderator approved it in between. So nothing relies
- * on events alone: a daily pass reads Reddit's list of the subreddit's newest
- * posts, erases the removed ones that no moderator removed (forgetRemoved),
- * erases every recorded post that should be in the list and is not
- * (forgetUnlisted), and reads the others again (indexExistingPosts).
+ * on events alone, with the one exception above: a daily pass reads Reddit's
+ * list of the subreddit's newest posts, erases the removed ones that no
+ * moderator removed (forgetRemoved), erases every other recorded post that
+ * should be in the list and is not (forgetUnlisted), and reads the rest again
+ * (indexExistingPosts).
  *
  * Every key is put on the `keys` list before it is written, because Reddit
  * gives an app no way to list its own keys. That is what lets a moderator
@@ -575,29 +579,34 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
         continue;
       }
       if (age < 0) continue;
-      // A post that is up counts as an original, and so does one that a
-      // moderator removed, when the subreddit wants that. When neither can be
-      // confirmed, leave the new post alone rather than remove it on a guess.
+      const removedKey = `removed:${candidate.id}`;
+      const marked = Boolean(await store.get(removedKey));
+      if (marked && settings.checkRemovedPosts) {
+        // A moderator removed it, and the subreddit wants that to count. For
+        // such a post the app goes by what Reddit has told it, and does not
+        // ask what became of the post since. Reddit reports an approval. It
+        // reports nothing when the author of a removed post deletes it, so
+        // that post keeps counting until its time is up.
+        match = candidate;
+        originalRemoved = true;
+        break;
+      }
+      // Any other post counts as an original only while it is up. When that
+      // cannot be confirmed, leave the new post alone rather than remove it on
+      // a guess.
       const info = await getInfo(candidate.id);
       if (!info) continue;
-      const removedKey = `removed:${candidate.id}`;
       if (info.state === 'up') {
-        // A mark that a moderator once removed it is out of date: the approval was missed.
-        if (await store.get(removedKey)) {
+        // A mark that a moderator once removed it is out of date here.
+        if (marked) {
           await store.del(removedKey);
           await unlistKeys([removedKey], store);
         }
         match = candidate;
         break;
       }
-      if (info.state === 'removed' && settings.checkRemovedPosts && (await store.get(removedKey))) {
-        match = candidate;
-        originalRemoved = true;
-        break;
-      }
-      // Deleted by its author, whatever happened to it before, or removed by
-      // AutoModerator, a filter or another app: it is erased, here and now if
-      // the event that said so never arrived.
+      // Deleted by its author, or removed in a way that does not count: it is
+      // erased, here and now if the event that said so never arrived.
       await forgetPost(candidate.id, deps);
       if (candidate.key) replaceable.add(candidate.key);
     }
@@ -719,13 +728,21 @@ export async function forgetRemoved(
 }
 
 /**
- * A moderator, a person, removed a post. The post is still on Reddit, only no
- * longer shown in the subreddit, and it stays recorded so that posting it
- * again is removed too. That ends when its cooldown ends, when a moderator
- * approves it, or when its author deletes it, and 30 days after this at the
- * latest. Returns whether the post is now remembered as removed.
+ * A moderator, a person, removed a post, and it stays recorded so that
+ * posting it again is removed too. Returns whether the post is now remembered
+ * as removed. Call this only when the subreddit has the option switched on.
  *
- * Call this only when the subreddit has the rule switched on.
+ * From here on the app goes by what Reddit tells it about the post, and by
+ * time. It stops counting when:
+ *   - a moderator approves it (Reddit reports that);
+ *   - Reddit sends a delete event for it, from its author or from Reddit;
+ *   - the app reads it for another reason, such as an edit, and finds it
+ *     deleted;
+ *   - its cooldown ends, and 30 days after this removal at the latest.
+ * Reddit sends no delete event when the author of a removed post deletes it.
+ * The app does not ask Reddit about such a post when something repeats it, and
+ * its daily pass leaves it alone, so until then it keeps counting. That is
+ * what stops someone from deleting a removed post only to post it again.
  */
 export async function handlePostRemovedByModerator(rawId: string, settings: Settings, deps: Deps): Promise<boolean> {
   const id = toPostId(rawId);
@@ -795,27 +812,43 @@ export async function eraseEverything(deps: Pick<Deps, 'store'>): Promise<number
 
 /**
  * Erases the recorded posts that Reddit no longer lists. `listed` holds the
- * posts that Reddit's list of the subreddit's newest posts shows as up, and
- * the list was read back to the time `from`. A recorded post made since then
- * that is not among them was deleted, or removed, and no event said so.
+ * posts in Reddit's list of the subreddit's newest posts that may stay
+ * recorded, and the list was read back to the time `from`. A recorded post
+ * made since then that is not among them was deleted, or removed, and no
+ * event said so.
  *
  * Posts made after `until` are left alone, because the list may not show a
  * post in its first minutes. So are posts made before `from`: the list did
- * not reach them, which says nothing about them. Returns how many recorded
- * posts were erased.
+ * not reach them, which says nothing about them.
+ *
+ * A post that a moderator removed is left alone too, where the subreddit has
+ * that option on. For such a post the app goes by Reddit's events and by its
+ * 30 days, and does not go looking: see handlePostRemovedByModerator.
+ *
+ * Returns how many recorded posts were erased.
  */
 export async function forgetUnlisted(
   listed: ReadonlySet<string>,
   from: number,
   until: number,
+  settings: Settings,
   deps: Pick<Deps, 'store' | 'now'>
 ): Promise<number> {
   if (!(from <= until)) return 0;
-  const recorded = await deps.store.zRange(RECORDED, from, until, { by: 'score' });
-  return forgetPosts(
-    recorded.map((entry) => entry.member).filter((id) => !listed.has(id)),
-    deps
-  );
+  const { store } = deps;
+  const recorded = await store.zRange(RECORDED, from, until, { by: 'score' });
+  const missing = recorded.map((entry) => entry.member).filter((id) => !listed.has(id));
+  if (!settings.checkRemovedPosts) return forgetPosts(missing, deps);
+
+  const unmarked: string[] = [];
+  for (let i = 0; i < missing.length; i += BATCH) {
+    const batch = missing.slice(i, i + BATCH);
+    const marks = await Promise.all(batch.map((id) => store.get(`removed:${id}`)));
+    batch.forEach((id, index) => {
+      if (!marks[index]) unmarked.push(id);
+    });
+  }
+  return forgetPosts(unmarked, deps);
 }
 
 /**
