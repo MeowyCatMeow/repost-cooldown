@@ -10,6 +10,10 @@ If a moderator removed the original, posting it again is removed too. If its aut
 
 Older posts are fine to share again once the cooldown is over.
 
+## Try it first
+
+You can test how the app behaves in its test subreddit, r/repost_cooldown_dev. Post the same thing there twice, and the second post is removed with a comment that says why.
+
 ## What counts as a repost
 
 - **Crosspost**: a crosspost of a post from this subreddit, or a plain link to one.
