@@ -36,7 +36,7 @@
       },
       {
         "label": "Repost Cooldown: erase stored data",
-        "description": "Erases everything the app has stored for this subreddit. Asks first.",
+        "description": "WARNING: erases everything the app has stored here. Cannot be undone. Asks first.",
         "forUserType": "moderator",
         "location": "subreddit",
         "endpoint": "/internal/menu/erase"

@@ -74,9 +74,9 @@ Reddit tells the app about most of these as they happen, and the app erases at o
 
 ### Erasing everything
 
-Moderators can erase everything the app has stored for the subreddit from the subreddit menu: **Repost Cooldown: erase stored data**. It asks first.
+Moderators can erase everything the app has stored for the subreddit. This is not on the settings page: it is an item in the subreddit's three-dot menu on Reddit, **Repost Cooldown: erase stored data**, next to the rescan item. It shows a warning and asks first, because erasing cannot be undone.
 
-The app stays switched on afterwards. It records new posts as they come in, and reads the existing ones again at its next daily check or when you pick the rescan. It no longer knows which removal comments it left before, so approving a post it removed earlier will not delete that comment.
+The app stays switched on afterwards. It records new posts as they come in, and reads the existing ones again at its next daily check or when you pick the rescan. Until then, reposts of posts that are up are not caught, and posts that a moderator removed are no longer remembered at all. It no longer knows which removal comments it left before, so approving a post it removed earlier will not delete that comment.
 
 What a version of the app up to 0.0.21 stored, and the app can no longer find, is not covered. It expires by itself, at the latest when the cooldown of the post it belongs to ends. The one exception is a marker those versions kept for a post that a moderator removed: it holds nothing but the post's ID, and can last up to a year.
 

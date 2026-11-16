@@ -367,14 +367,22 @@ async function route(req: IncomingMessage): Promise<object | undefined> {
         showForm: {
           name: ERASE_FORM,
           form: {
-            title: 'Erase what Repost Cooldown has stored?',
+            title: 'WARNING: erase what Repost Cooldown has stored?',
             description:
-              `This erases everything the app has stored for r/${context.subredditName}: the fingerprints of ` +
-              'recent posts and its notes about them. It cannot be undone. The app stays switched on: it records ' +
-              'new posts as they come in, and reads the existing ones again at its next daily check or when you ' +
-              'pick "rescan recent posts". What an earlier version of the app stored, and this one cannot find, ' +
-              'expires by itself.',
-            fields: [{ type: 'boolean', name: 'confirm', label: 'Yes, erase it all', defaultValue: false }],
+              `WARNING: this cannot be undone. It erases everything the app has stored for r/${context.subredditName}: ` +
+              'the fingerprints of recent posts and its notes about them. Until the app has read the subreddit ' +
+              'again, reposts of posts that are up now are not caught, and posts that a moderator removed are no ' +
+              'longer remembered at all. The app stays switched on: it records new posts as they come in, and reads ' +
+              'the existing ones again at its next daily check or when you pick "rescan recent posts". What an ' +
+              'earlier version of the app stored, and this one cannot find, expires by itself.',
+            fields: [
+              {
+                type: 'boolean',
+                name: 'confirm',
+                label: 'I have read the warning. Erase it all.',
+                defaultValue: false,
+              },
+            ],
             acceptLabel: 'Erase',
             cancelLabel: 'Cancel',
           },

@@ -8,6 +8,7 @@ import { readFile } from 'node:fs/promises';
 import { registerHooks } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { after, afterEach, beforeEach, test } from 'node:test';
+import { parseSettings } from '../src/core/cooldown.ts';
 
 const fakeUrl = new URL('./fake-devvit.ts', import.meta.url).href;
 registerHooks({
@@ -491,9 +492,16 @@ test('the erase menu item asks first, and erases everything only when the box is
 
   const asked = await call('/internal/menu/erase', {});
   assert.equal(asked.status, 200);
-  const shown = asked.body.showForm as { name: string; form: { fields: Array<{ type: string; name: string }>; acceptLabel: string } };
+  const shown = asked.body.showForm as {
+    name: string;
+    form: { title: string; description: string; fields: Array<{ type: string; name: string; defaultValue: boolean }> };
+  };
   assert.equal(shown.name, 'eraseForm');
-  assert.deepEqual(shown.form.fields.map((field) => [field.type, field.name]), [['boolean', 'confirm']]);
+  assert.deepEqual(shown.form.fields.map((field) => [field.type, field.name, field.defaultValue]), [['boolean', 'confirm', false]]);
+  // The moderator is warned before anything happens, in the title and at the start of the text.
+  assert.match(shown.form.title, /^WARNING/);
+  assert.match(shown.form.description, /^WARNING: this cannot be undone\./);
+  assert.ok(shown.form.description.includes('r/home'));
 
   // Asking erased nothing, and neither does an answer without the tick.
   const stored = state.redis.size;
@@ -523,11 +531,23 @@ test('every endpoint named in devvit.json is served', async () => {
   const config = JSON.parse(await readFile(new URL('../devvit.json', import.meta.url), 'utf8')) as {
     triggers: Record<string, string>;
     scheduler: { tasks: Record<string, { endpoint: string; cron: string }> };
-    menu: { items: Array<{ endpoint: string }> };
+    menu: { items: Array<{ endpoint: string; label: string; description: string; forUserType: string; location: string }> };
     forms: Record<string, string>;
+    settings: { subreddit: Record<string, { defaultValue: unknown }> };
   };
   // The form the erase menu item shows must be one that devvit.json names.
   assert.deepEqual(config.forms, { eraseForm: '/internal/form/erase' });
+  // Both menu items are for moderators, on the subreddit, and the erase item carries its warning.
+  assert.deepEqual(config.menu.items.map((item) => [item.label, item.forUserType, item.location]), [
+    ['Repost Cooldown: rescan recent posts', 'moderator', 'subreddit'],
+    ['Repost Cooldown: erase stored data', 'moderator', 'subreddit'],
+  ]);
+  assert.match(config.menu.items[1]!.description, /^WARNING/);
+  // What the settings page shows before a moderator changes anything is what the app uses.
+  const defaults = Object.fromEntries(Object.entries(config.settings.subreddit).map(([name, field]) => [name, field.defaultValue]));
+  assert.equal(defaults.exemptModerators, true);
+  assert.equal(defaults.checkRemovedPosts, false);
+  assert.deepEqual(parseSettings(defaults), parseSettings(undefined));
   const endpoints = [
     ...Object.values(config.triggers),
     ...Object.values(config.scheduler.tasks).map((task) => task.endpoint),
