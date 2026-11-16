@@ -33,6 +33,7 @@ export const state = {
   distinguishFail: false,
   removed: [] as string[],
   comments: [] as Array<{ id: string; text: string; pinned: boolean }>,
+  deletedComments: [] as string[],
   notes: [] as string[],
   /** How many pages of the "new" listing were read. */
   listingPages: 0,
@@ -48,6 +49,7 @@ export function reset(): void {
   state.distinguishFail = false;
   state.removed.length = 0;
   state.comments.length = 0;
+  state.deletedComments.length = 0;
   state.notes.length = 0;
   state.listingPages = 0;
 }
@@ -131,9 +133,17 @@ export const reddit = {
     const comment = { id: options.id, text: options.text, pinned: false };
     state.comments.push(comment);
     return {
+      id: `t1_c${state.comments.length}`,
       async distinguish(makeSticky = false): Promise<void> {
         if (state.distinguishFail) throw new Error('could not distinguish');
         comment.pinned = makeSticky;
+      },
+    };
+  },
+  async getCommentById(commentId: string) {
+    return {
+      async delete(): Promise<void> {
+        state.deletedComments.push(commentId);
       },
     };
   },

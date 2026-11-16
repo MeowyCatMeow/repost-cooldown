@@ -42,6 +42,12 @@
         "helpText": "A post that a moderator removes still counts as an original until its cooldown is over, even if its author then deletes it. Removals by AutoModerator and by other apps are not counted.",
         "defaultValue": true
       },
+      "ignoredRemovers": {
+        "type": "string",
+        "label": "Moderator accounts whose removals are not counted",
+        "helpText": "Usernames separated by commas, for bots that run under an ordinary account. AutoModerator and other apps are never counted, so they do not need to be listed.",
+        "defaultValue": ""
+      },
       "checkCrossposts": {
         "type": "boolean",
         "label": "Remove crossposts of posts from this subreddit",

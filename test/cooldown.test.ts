@@ -28,6 +28,7 @@ class World {
   moderators = new Set<string>();
   removed: string[] = [];
   comments: Array<{ id: string; text: string }> = [];
+  deletedComments: string[] = [];
   notes: string[] = [];
   unreadable = new Set<string>();
   nextId = 1;
@@ -73,6 +74,10 @@ class World {
       },
       comment: async (id, text) => {
         this.comments.push({ id, text });
+        return `t1_c${this.comments.length}`;
+      },
+      deleteComment: async (commentId) => {
+        this.deletedComments.push(commentId);
       },
       addRemovalNote: async (_id, note) => {
         this.notes.push(note);
@@ -625,8 +630,8 @@ test('a removed post that a moderator approves is an ordinary post again', async
   await removeAsModerator(w, first.post.id);
   // The moderator changes their mind.
   w.posts.get(first.post.id)!.removed = false;
-  assert.equal(await handlePostApproved(first.post.id, w.deps), true);
-  assert.equal(await handlePostApproved(first.post.id, w.deps), false);
+  assert.deepEqual(await handlePostApproved(first.post.id, w.deps), { unmarked: true, commentDeleted: false });
+  assert.deepEqual(await handlePostApproved(first.post.id, w.deps), { unmarked: false, commentDeleted: false });
 
   const again = await w.submit({ title: 'The very same title twice' });
   assert.deepEqual(again.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
@@ -652,6 +657,33 @@ test('the check for removed posts can be switched off, and it ends with the cool
   const late = await w.submit({ title: 'Another title that is used twice' });
   assert.equal(late.outcome.action, 'indexed');
   assert.deepEqual(w.removed, []);
+});
+
+test('approving a post the app removed deletes the comment that said it was removed', async () => {
+  const w = new World();
+  await w.submit({ title: 'The very same title twice' });
+  const repost = await w.submit({ title: 'The very same title twice' });
+  assert.equal(repost.outcome.action, 'removed');
+  // A moderator decides the repost is fine after all.
+  assert.deepEqual(await handlePostApproved(repost.post.id, w.deps), { unmarked: false, commentDeleted: true });
+  assert.deepEqual(w.deletedComments, ['t1_c1']);
+  assert.deepEqual(await handlePostApproved(repost.post.id, w.deps), { unmarked: false, commentDeleted: false });
+  assert.deepEqual(w.deletedComments, ['t1_c1']);
+});
+
+test('a mark left by a missed approval is dropped once the post is seen to be up', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice' });
+  await removeAsModerator(w, first.post.id);
+  // It was approved again, but the app never heard about it.
+  w.posts.get(first.post.id)!.removed = false;
+  const second = await w.submit({ title: 'The very same title twice' });
+  assert.deepEqual(second.outcome, { action: 'removed', reason: 'title', originalId: first.post.id });
+
+  // Taken down later by something that does not count: it is free again.
+  w.posts.get(first.post.id)!.removed = true;
+  const third = await w.submit({ title: 'The very same title twice' });
+  assert.equal(third.outcome.action, 'indexed');
 });
 
 test('a removal is only remembered for a post the app keeps track of', async () => {
@@ -724,4 +756,9 @@ test('settings fall back to defaults and are clamped', () => {
   assert.equal(parsed.minTitleLength, DEFAULT_SETTINGS.minTitleLength);
   assert.equal(parsed.removalMessage, DEFAULT_SETTINGS.removalMessage);
   assert.equal(parseSettings({ cooldownDays: 14 }).cooldownDays, 14);
+  assert.deepEqual(parseSettings({ ignoredRemovers: 'u/FloodBot, other_bot  /u/Third,' }).ignoredRemovers, [
+    'floodbot',
+    'other_bot',
+    'third',
+  ]);
 });

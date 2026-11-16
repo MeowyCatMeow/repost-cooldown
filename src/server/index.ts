@@ -74,6 +74,11 @@ const gateway: RedditGateway = {
       // The comment is there; it is only not pinned to the top.
       log(`commented on ${id} but could not pin the comment: ${String(error)}`);
     }
+    return comment.id;
+  },
+  async deleteComment(commentId) {
+    const comment = await reddit.getCommentById(commentId as `t1_${string}`);
+    await comment.delete();
   },
   async addRemovalNote(id, note) {
     await reddit.addRemovalNote({ itemIds: [id], reasonId: '', modNote: note.slice(0, 100) });
@@ -143,6 +148,9 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
 async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
   const post = incomingPost(event);
   if (!post) return;
+  // A post's title and link cannot be edited, so when the text is the same as
+  // before, nothing it is compared by has changed.
+  if ((event.previousBody ?? '') === (post.body ?? '')) return;
   if (await handlePostEdited(post, await loadSettings(), deps())) log(`${post.id}: edited, recorded again`);
 }
 
@@ -163,7 +171,9 @@ async function onModAction(event: OnModActionRequest): Promise<void> {
   const id = toPostId(event.targetPost?.id);
   if (!id) return;
   if (event.action === 'approvelink') {
-    if (await handlePostApproved(id, { store: redis })) log(`${id}: approved, an ordinary post again`);
+    const approved = await handlePostApproved(id, deps());
+    if (approved.unmarked) log(`${id}: approved, an ordinary post again`);
+    if (approved.commentDeleted) log(`${id}: approved after the app removed it, removal comment deleted`);
     return;
   }
   if (event.action !== 'removelink' && event.action !== 'spamlink') return;
@@ -171,11 +181,10 @@ async function onModAction(event: OnModActionRequest): Promise<void> {
   const name = (event.moderator?.name ?? '').toLowerCase();
   // The app's own removals are reposts, which were never originals.
   if (name === context.appSlug.toLowerCase()) return;
-  const accountType = event.moderator?.accountType;
-  if (!holds(accountType, PERSON, 'ACCOUNT_TYPE_USER') || name === 'automoderator') {
-    log(`${id}: removed by AutoModerator or an app (account type ${String(accountType)}), not counted`);
-    return;
-  }
+  if (!holds(event.moderator?.accountType, PERSON, 'ACCOUNT_TYPE_USER') || name === 'automoderator') return;
+  // A bot that runs under an ordinary account looks like a person; the
+  // moderators can name such accounts in the settings.
+  if ((await loadSettings()).ignoredRemovers.includes(name)) return;
   if (await handlePostRemovedByModerator(id, { store: redis, now: () => Date.now() })) {
     log(`${id}: removed by a moderator, so posting it again is removed too`);
   }

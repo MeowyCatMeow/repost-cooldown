@@ -10,6 +10,7 @@
  *   post:<id>        -> {"at","keys"}  a known post and the fingerprints it owns
  *   seen:<id>        -> a token        the post's submit event is being, or was, handled
  *   removed:<id>     -> "1"            a moderator took the post down; it still counts as an original
+ *   comment:<id>     -> a comment id   the removal comment the app left on a post it removed
  * Every key expires on its own once its post is older than the cooldown; a
  * "removed" mark expires once its post is older than the longest cooldown.
  */
@@ -34,6 +35,8 @@ export type Settings = {
   cooldownDays: number;
   /** A post that a moderator removed still counts as an original. */
   checkRemovedPosts: boolean;
+  /** Lowercase names of moderator accounts whose removals do not count: bots that run as ordinary accounts. */
+  ignoredRemovers: string[];
   checkCrossposts: boolean;
   checkLinks: boolean;
   /** Links inside a post's text are compared when it has at most this many; 0 turns that off. */
@@ -65,6 +68,7 @@ export const DEFAULT_REMOVED_ORIGINAL_MESSAGE =
 export const DEFAULT_SETTINGS: Settings = {
   cooldownDays: 30,
   checkRemovedPosts: true,
+  ignoredRemovers: [],
   checkCrossposts: true,
   checkLinks: true,
   maxTextLinks: 5,
@@ -93,9 +97,18 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     const value = raw?.[name];
     return typeof value === 'string' && value.trim() ? value : DEFAULT_SETTINGS[name];
   };
+  // "u/Name, other-name" to ["name", "other-name"].
+  const names = (value: unknown): string[] =>
+    typeof value === 'string'
+      ? value
+          .split(/[\s,]+/)
+          .map((name) => name.replace(/^\/?u\//i, '').toLowerCase())
+          .filter(Boolean)
+      : [];
   return {
     cooldownDays: num('cooldownDays', 1, MAX_COOLDOWN_DAYS),
     checkRemovedPosts: bool('checkRemovedPosts'),
+    ignoredRemovers: names(raw?.ignoredRemovers),
     checkCrossposts: bool('checkCrossposts'),
     checkLinks: bool('checkLinks'),
     maxTextLinks: num('maxTextLinks', 0, 100),
@@ -134,8 +147,10 @@ export interface RedditGateway {
   getPostInfo(id: string): Promise<PostInfo>;
   isModerator(username: string): Promise<boolean>;
   remove(id: string): Promise<void>;
-  /** Posts a comment on the post, as a stickied moderator comment. */
-  comment(id: string, text: string): Promise<void>;
+  /** Posts a comment on the post, as a stickied moderator comment, and returns the comment's id. */
+  comment(id: string, text: string): Promise<string | undefined>;
+  /** Deletes a comment the app made. */
+  deleteComment(commentId: string): Promise<void>;
   addRemovalNote(id: string, note: string): Promise<void>;
 }
 
@@ -437,6 +452,9 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
         if (candidate.key) replaceable.add(candidate.key);
         continue;
       }
+      // It is up, so any mark that a moderator once took it down is out of
+      // date (the approval was missed) and must not outlive this.
+      await store.del(`removed:${candidate.id}`);
       match = candidate;
       break;
     }
@@ -466,7 +484,11 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
         subreddit: post.subredditName,
       });
       try {
-        await reddit.comment(post.id, text);
+        const commentId = await reddit.comment(post.id, text);
+        // Remembered so that the comment can be taken off if a moderator approves the post after all.
+        if (commentId) {
+          await store.set(`comment:${post.id}`, commentId, { expiration: new Date(deps.now() + cooldownMs + HOUR_MS) });
+        }
       } catch (error) {
         deps.log?.(`removed ${post.id} but could not comment: ${String(error)}`);
       }
@@ -551,16 +573,36 @@ export async function handlePostRemovedByModerator(rawId: string, deps: Pick<Dep
 }
 
 /**
- * A moderator approved a post: if it had been taken down, it is an ordinary
- * post again. Returns whether it had been marked as taken down.
+ * A moderator approved a post. If a moderator had taken it down, it is an
+ * ordinary post again. If the app had removed it as a repost, the app's
+ * comment saying so is no longer true and is deleted.
  */
-export async function handlePostApproved(rawId: string, deps: Pick<Deps, 'store'>): Promise<boolean> {
+export async function handlePostApproved(
+  rawId: string,
+  deps: Pick<Deps, 'store' | 'reddit' | 'log'>
+): Promise<{ unmarked: boolean; commentDeleted: boolean }> {
+  const result = { unmarked: false, commentDeleted: false };
   const id = toPostId(rawId);
-  if (!id) return false;
-  const key = `removed:${id}`;
-  if (!(await deps.store.get(key))) return false;
-  await deps.store.del(key);
-  return true;
+  if (!id) return result;
+
+  const mark = `removed:${id}`;
+  if (await deps.store.get(mark)) {
+    await deps.store.del(mark);
+    result.unmarked = true;
+  }
+
+  const commentKey = `comment:${id}`;
+  const commentId = await deps.store.get(commentKey);
+  if (commentId) {
+    try {
+      await deps.reddit.deleteComment(commentId);
+      result.commentDeleted = true;
+    } catch (error) {
+      deps.log?.(`${id} was approved but the removal comment could not be deleted: ${String(error)}`);
+    }
+    await deps.store.del(commentKey);
+  }
+  return result;
 }
 
 /**

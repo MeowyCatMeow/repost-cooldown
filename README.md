@@ -35,9 +35,11 @@ A removed post gets a stickied comment that links to the original, and a mod not
 
 A moderator removes a post for a reason, so the app keeps counting that post as the original until its cooldown is over. The repost gets its own comment, which says that the moderators removed the earlier post.
 
-Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's.
+Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's. A bot that runs under an ordinary account looks like a person, so name such accounts in the settings to leave their removals out.
 
 If you remove a post for something its author can fix, such as a missing flair, and they post it again, the app removes the new post. Approve it to let it through.
+
+Whenever a moderator approves a post that the app removed, the app deletes its own comment from that post.
 
 This covers removals made while the app is installed. It can be switched off in the settings, and then a removed post no longer blocks anything.
 
@@ -64,6 +66,7 @@ Moderators can change these from the app's settings page in the subreddit:
 | --- | --- |
 | Cooldown (days) | 30 |
 | Remove reposts of posts that a moderator removed | on |
+| Moderator accounts whose removals are not counted | none |
 | Remove crossposts of posts from this subreddit | on |
 | Remove posts that share a link with a recent post | on |
 | Compare links inside a post's text when it has at most this many | 5 |

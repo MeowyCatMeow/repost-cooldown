@@ -126,8 +126,8 @@ test('an edited post is read again', async () => {
   assert.deepEqual(state.removed, []);
 });
 
-/** A moderator action as Reddit reports it. Account type 1 is a person, 3 is an app. */
-const modAction = (action: string, id: string, moderator: { name: string; accountType: number }) =>
+/** A moderator action as Reddit reports it. Account type 1 is a person, 3 is an app; Reddit may send the name instead. */
+const modAction = (action: string, id: string, moderator: { name: string; accountType: number | string }) =>
   call('/internal/triggers/mod-action', {
     type: 'ModAction',
     action,
@@ -135,28 +135,33 @@ const modAction = (action: string, id: string, moderator: { name: string; accoun
     moderator: { id: 't2_moderator', ...moderator },
   });
 
-test('a post removed by a person still counts; one removed by an app or AutoModerator does not', async () => {
+test('a post removed by a person still counts; one removed by an app or a bot does not', async () => {
+  // The moderators have named a bot that runs under an ordinary account.
+  state.settings = { ignoredRemovers: 'u/Ordinary-Bot' };
   const cases = [
-    { title: 'A title removed by a person', remover: { name: 'modmary', accountType: 1 } },
-    { title: 'A title removed by another app', remover: { name: 'flood-assistant', accountType: 3 } },
-    { title: 'A title removed by AutoModerator', remover: { name: 'AutoModerator', accountType: 1 } },
+    { title: 'A title removed by a person', action: 'removelink', remover: { name: 'modmary', accountType: 1 }, counts: true },
+    { title: 'A title marked as spam by a person', action: 'spamlink', remover: { name: 'modmary', accountType: 'ACCOUNT_TYPE_USER' }, counts: true },
+    { title: 'A title removed by another app', action: 'removelink', remover: { name: 'flood-assistant', accountType: 3 }, counts: false },
+    { title: 'A title removed by AutoModerator', action: 'removelink', remover: { name: 'AutoModerator', accountType: 1 }, counts: false },
+    { title: 'A title removed by a named bot', action: 'removelink', remover: { name: 'ordinary-bot', accountType: 1 }, counts: false },
+    { title: 'A title removed by an unknown kind', action: 'removelink', remover: { name: 'someone', accountType: 0 }, counts: false },
   ];
   const originals: string[] = [];
-  for (const [index, { title, remover }] of cases.entries()) {
+  for (const [index, { title, action, remover }] of cases.entries()) {
     const original = post({ title, url: `https://i.redd.it/original${index}.png` });
     await submit(original.event);
     state.posts.get(original.id)!.removed = true;
-    assert.equal((await modAction('removelink', original.id, remover)).status, 200);
+    assert.equal((await modAction(action, original.id, remover)).status, 200);
     originals.push(original.id);
   }
 
-  const reposts: string[] = [];
-  for (const [index, { title }] of cases.entries()) {
+  const expected: string[] = [];
+  for (const [index, { title, counts }] of cases.entries()) {
     const repost = post({ title, url: `https://i.redd.it/repost${index}.png`, author: 'bob' });
     await submit(repost.event);
-    reposts.push(repost.id);
+    if (counts) expected.push(repost.id);
   }
-  assert.deepEqual(state.removed, [reposts[0]]);
+  assert.deepEqual(state.removed, expected);
   assert.match(state.comments[0]!.text, /that the moderators of r\/home removed/);
 
   // Approving the removed post makes it an ordinary post again.
@@ -166,15 +171,43 @@ test('a post removed by a person still counts; one removed by an app or AutoMode
   assert.equal(state.redis.has(`removed:${originals[0]}`), false);
 });
 
+test('approving a post the app removed deletes its removal comment', async () => {
+  await submit(post({ title: 'Screenshot of the day from the app', url: 'https://i.redd.it/one.png' }).event);
+  const repost = post({ title: 'Screenshot of the day from the app', url: 'https://i.redd.it/two.png' });
+  await submit(repost.event);
+  assert.deepEqual(state.removed, [repost.id]);
+  // The app's own removal arrives as a moderator action too, and changes nothing.
+  await modAction('removelink', repost.id, { name: 'repost-cooldown', accountType: 3 });
+  assert.deepEqual(state.deletedComments, []);
+
+  await modAction('approvelink', repost.id, { name: 'modmary', accountType: 1 });
+  assert.deepEqual(state.deletedComments, ['t1_c1']);
+});
+
 test('only the author deleting a post frees it at once', async () => {
-  const original = post({ title: 'A title that will be deleted', url: 'https://i.redd.it/deleted.png' });
-  await submit(original.event);
-  const record = `post:${original.id}`;
-  // Reddit reports a removal by a moderator as a delete too; that frees nothing.
-  await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 3 });
-  assert.equal(state.redis.has(record), true);
-  await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 1 });
-  assert.equal(state.redis.has(record), false);
+  for (const byAuthor of [1, 'USER']) {
+    const original = post({ title: `A title that will be deleted ${byAuthor}`, url: `https://i.redd.it/deleted${byAuthor}.png` });
+    await submit(original.event);
+    const record = `post:${original.id}`;
+    // Reddit reports a removal by a moderator as a delete too; that frees nothing.
+    await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 3 });
+    await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 0 });
+    await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id });
+    assert.equal(state.redis.has(record), true);
+    await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: byAuthor });
+    assert.equal(state.redis.has(record), false);
+  }
+});
+
+test('an update that leaves the text as it was changes nothing', async () => {
+  const link = 'https://example.com/product-page';
+  const first = post({ title: 'First write-up about the product', text: `Details here: ${link}` });
+  await submit(first.event);
+  const before = JSON.stringify([...state.redis]);
+  // An update event that carries no text, for a change that was not to the text.
+  const unchanged = { ...first.event, post: { ...first.event.post, selftext: '' }, previousBody: '' };
+  assert.equal((await call('/internal/triggers/post-update', { type: 'PostUpdate', ...unchanged })).status, 200);
+  assert.equal(JSON.stringify([...state.redis]), before);
 });
 
 test('installing records recent posts and stops reading at the cooldown', async () => {
