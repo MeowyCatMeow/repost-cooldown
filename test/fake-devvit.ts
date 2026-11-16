@@ -107,7 +107,13 @@ export const redis = {
     return 'OK';
   },
   async del(...keys: string[]): Promise<void> {
-    for (const key of keys) state.redis.delete(key);
+    for (const key of keys) {
+      state.redis.delete(key);
+      state.sorted.delete(key);
+    }
+  },
+  async exists(...keys: string[]): Promise<number> {
+    return keys.filter((key) => read(key) !== undefined || (state.sorted.get(key)?.size ?? 0) > 0).length;
   },
   async zAdd(key: string, ...members: Array<{ member: string; score: number }>): Promise<number> {
     const set = state.sorted.get(key) ?? new Map<string, number>();
@@ -121,11 +127,13 @@ export const redis = {
     stop: number | string,
     options?: { by: 'score' | 'lex' | 'rank' }
   ): Promise<Array<{ member: string; score: number }>> {
-    if (options?.by !== 'score') throw new Error('this stand-in only ranges by score');
-    return [...(state.sorted.get(key) ?? [])]
-      .filter(([, score]) => score >= Number(start) && score <= Number(stop))
-      .sort((a, b) => a[1] - b[1])
+    const ordered = [...(state.sorted.get(key) ?? [])]
+      .sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : 1))
       .map(([member, score]) => ({ member, score }));
+    if (options?.by === 'score') return ordered.filter(({ score }) => score >= Number(start) && score <= Number(stop));
+    // By rank, both ends count, as in Redis.
+    if (options?.by === 'rank') return ordered.slice(Number(start), Number(stop) + 1);
+    throw new Error('this stand-in ranges by score or by rank');
   },
   async zRem(key: string, members: string[]): Promise<number> {
     const set = state.sorted.get(key);

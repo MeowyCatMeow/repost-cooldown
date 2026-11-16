@@ -33,8 +33,18 @@
         "forUserType": "moderator",
         "location": "subreddit",
         "endpoint": "/internal/menu/rescan"
+      },
+      {
+        "label": "Repost Cooldown: erase stored data",
+        "description": "Erases everything the app has stored for this subreddit. Asks first.",
+        "forUserType": "moderator",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/erase"
       }
     ]
+  },
+  "forms": {
+    "eraseForm": "/internal/form/erase"
   },
   "settings": {
     "subreddit": {
@@ -43,6 +53,18 @@
         "label": "Cooldown (days)",
         "helpText": "A repost or same-sub crosspost is removed if the original is newer than this and still up. A shorter cooldown applies at once; a longer one is only certain to cover posts made after the change. A cooldown longer than 30 days is fully applied only if the subreddit gets fewer than 1000 posts in that time; a busier one gets at least 30 days.",
         "defaultValue": 30
+      },
+      "checkRemovedPosts": {
+        "type": "boolean",
+        "label": "Also remove reposts of posts that a moderator removed",
+        "helpText": "Off unless you switch it on. When on: a post that a moderator removes by hand still counts as an original, so posting it again is removed. That lasts until the post's cooldown ends, for 30 days at most, and ends sooner if a moderator approves the post or its author deletes it. Removals by AutoModerator, Reddit and other apps never count.",
+        "defaultValue": false
+      },
+      "ignoredRemovers": {
+        "type": "string",
+        "label": "Moderator accounts whose removals are not counted",
+        "helpText": "Only used when the option above is on. Usernames separated by commas, for bots that run under an ordinary account. AutoModerator and other apps are never counted, so they do not need to be listed.",
+        "defaultValue": ""
       },
       "checkCrossposts": {
         "type": "boolean",
@@ -98,6 +120,12 @@
         "label": "Removal comment",
         "helpText": "Placeholders: {author}, {reason}, {original}, {age}, {cooldown}, {subreddit}.",
         "defaultValue": "Hi u/{author}, your post was removed because {reason}: [the earlier post]({original}), made {age}.\n\nIn r/{subreddit} the same post can be shared again once {cooldown} days have passed since the original.\n\n*I am a bot. If you think this was a mistake, please [message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*"
+      },
+      "removedOriginalMessage": {
+        "type": "paragraph",
+        "label": "Removal comment when the original was removed by a moderator",
+        "helpText": "Only used when that option is on, instead of the comment above. The same placeholders work.",
+        "defaultValue": "Hi u/{author}, your post was removed because it repeats [an earlier post]({original}) that the moderators of r/{subreddit} removed.\n\nPlease do not post it again.\n\n*I am a bot. If you think this was a mistake, please [message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*"
       }
     }
   },

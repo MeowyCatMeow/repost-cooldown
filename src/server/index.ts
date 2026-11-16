@@ -2,7 +2,8 @@
  * Devvit entry point. Reddit calls these endpoints (declared in devvit.json)
  * when a post is submitted, edited, deleted or removed, when a moderator
  * approves one, when the app is installed or updated, once a day, and when a
- * moderator picks the rescan menu item. The rules live in ../core/cooldown.ts.
+ * moderator picks one of the app's menu items. The rules live in
+ * ../core/cooldown.ts.
  */
 import type { IncomingMessage } from 'node:http';
 import { context, createServer, getServerPort, reddit, redis, settings } from '@devvit/web/server';
@@ -15,17 +16,21 @@ import type {
   UiResponse,
 } from '@devvit/web/shared';
 import {
+  eraseEverything,
   forgetPost,
   forgetPosts,
+  forgetRemoved,
   forgetUnlisted,
   handleNewPost,
   handlePostApproved,
   handlePostEdited,
+  handlePostRemovedByModerator,
   indexExistingPosts,
   parseSettings,
   toMillis,
   type Deps,
   type IncomingPost,
+  type PostState,
   type RedditGateway,
   type Settings,
 } from '../core/cooldown.ts';
@@ -38,14 +43,32 @@ type RedditPost = Awaited<ReturnType<typeof reddit.getPostById>>;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** A post made in the last few minutes may not be in Reddit's list of newest posts yet. */
 const LISTING_LAG_MS = 10 * 60 * 1000;
+/** The form that asks a moderator to confirm the erasing; devvit.json names it too. */
+const ERASE_FORM = 'eraseForm';
+
+/**
+ * How Reddit's events say who took a post down, and what kind of account a
+ * moderator is. Reddit sends such a value as a number or by its name.
+ */
+const BY_AUTHOR = [1, 'USER'] as const;
+const BY_REDDIT = [2, 'ADMIN'] as const;
+const BY_MODERATOR = [3, 'MODERATOR'] as const;
+const PERSON = [1, 'ACCOUNT_TYPE_USER'] as const;
+
+function holds(value: unknown, [number, name]: readonly [number, string]): boolean {
+  return Number(value) === number || value === name;
+}
 
 function log(message: string): void {
   console.log(`[repost-cooldown] ${message}`);
 }
 
-/** True when the post is no longer up: removed, marked as spam, filtered, or deleted by its author. */
-function isGone(post: RedditPost): boolean {
-  return post.removed || post.spam || Boolean(post.removedByCategory) || post.authorName === '[deleted]';
+function stateOf(post: RedditPost): PostState {
+  // A deleted post has lost its author. So has a post whose author deleted
+  // their account, and the app treats that one the same way.
+  if (post.authorName === '[deleted]' || post.removedByCategory === 'deleted') return 'deleted';
+  // Removed, marked as spam, or held back by a filter.
+  return post.removed || post.spam || post.removedByCategory ? 'removed' : 'up';
 }
 
 function fromReddit(post: RedditPost): IncomingPost {
@@ -69,13 +92,13 @@ const gateway: RedditGateway = {
       id: post.id,
       subredditId: post.subredditId,
       createdAt: post.createdAt.getTime(),
-      removed: isGone(post),
+      state: stateOf(post),
       permalink: post.permalink,
     };
   },
   async getPost(id) {
     const post = await reddit.getPostById(id as PostId);
-    return isGone(post) ? undefined : fromReddit(post);
+    return { state: stateOf(post), post: fromReddit(post) };
   },
   async isModerator(username) {
     const found = await reddit.getModerators({ subredditName: context.subredditName, username }).all();
@@ -149,7 +172,8 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   // only: no usernames, links or text from the subreddits that install the app.
   const who = post.id;
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
-    log(`${who}: ${outcome.action} (${outcome.reason} match with ${outcome.originalId})`);
+    const original = outcome.originalRemoved ? `${outcome.originalId}, which a moderator removed` : outcome.originalId;
+    log(`${who}: ${outcome.action} (${outcome.reason} match with ${original})`);
   } else if (outcome.action === 'gone') {
     log(`${who}: already deleted or removed, nothing recorded`);
   } else if (outcome.action === 'indexed') {
@@ -167,36 +191,66 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
 async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
   const post = incomingPost(event);
   if (!post) return;
-  // A post's title and link cannot be edited, so when the text is the same as
-  // before, nothing it is compared by has changed.
-  if ((event.previousBody ?? '') === (post.body ?? '')) return;
-  if (await handlePostEdited(post, await loadSettings(), deps())) log(`${post.id}: edited, recorded again`);
+  const textUnchanged = (event.previousBody ?? '') === (post.body ?? '');
+  if (await handlePostEdited(post, loadSettings, deps(), textUnchanged)) log(`${post.id}: edited, recorded again`);
 }
 
 /**
- * Reddit sends this when a post is deleted by its author, and when it is
- * removed by a moderator or by Reddit. Whoever did it, the app must not keep
- * anything made from the post, so it is erased.
+ * Reddit sends this when a post is deleted by its author, when Reddit takes it
+ * down, and when a moderator removes it. The first two erase the post at once,
+ * whatever happened to it before. A moderator's removal is not decided here:
+ * the moderator action that follows says who removed it.
  */
 async function onPostDelete(event: OnPostDeleteRequest): Promise<void> {
   const id = toPostId(event.postId);
-  if (id && (await forgetPost(id, deps()))) log(`${id}: deleted or removed, erased`);
+  if (!id || holds(event.source, BY_MODERATOR)) return;
+  if (!holds(event.source, BY_AUTHOR) && !holds(event.source, BY_REDDIT)) {
+    // Reddit did not say who did it, so the app looks at what became of the
+    // post. A removal is left to the moderator action and the daily check.
+    // A post that can no longer be read at all is treated as deleted.
+    const state = await gateway.getPostInfo(id).then(
+      (info) => info.state,
+      () => 'deleted' as const
+    );
+    if (state !== 'deleted') return;
+  }
+  if (await forgetPost(id, deps())) log(`${id}: deleted, or taken down by Reddit: erased`);
 }
 
+/**
+ * A moderator removing a post is a decision about that post, so the post stays
+ * recorded and posting it again is removed too. Only a person's removal
+ * counts: AutoModerator and other apps often remove a post because of who
+ * posted it or how often, and the same post from someone else, or later, may
+ * be fine. A post they remove is erased.
+ */
 async function onModAction(event: OnModActionRequest): Promise<void> {
   const id = toPostId(event.targetPost?.id);
   if (!id) return;
   if (event.action === 'approvelink') {
     const approved = await handlePostApproved(id, loadSettings, deps());
+    if (approved.unmarked) log(`${id}: approved, an ordinary post again`);
     if (approved.commentDeleted) log(`${id}: approved after the app removed it, removal comment deleted`);
     if (approved.recorded) log(`${id}: approved, recorded again`);
     return;
   }
-  // A removal usually arrives as a delete event too, but not always, and not
-  // always first. Erasing twice does no harm.
-  if (event.action === 'removelink' || event.action === 'spamlink') {
-    if (await forgetPost(id, deps())) log(`${id}: removed, erased`);
+  if (event.action !== 'removelink' && event.action !== 'spamlink') return;
+
+  const name = (event.moderator?.name ?? '').toLowerCase();
+  const person =
+    holds(event.moderator?.accountType, PERSON) && name !== 'automoderator' && name !== context.appSlug.toLowerCase();
+  if (person) {
+    const current = await loadSettings();
+    // A bot that runs under an ordinary account looks like a person; the
+    // moderators can name such accounts in the settings.
+    if (current.checkRemovedPosts && !current.ignoredRemovers.includes(name)) {
+      if (await handlePostRemovedByModerator(id, current, deps())) {
+        log(`${id}: removed by a moderator, so posting it again is removed too`);
+      }
+      return;
+    }
   }
+  if (await forgetPost(id, deps())) log(`${id}: removed, erased`);
 }
 
 /** Recording removes nothing, so the defaults are a safe stand-in when the settings cannot be read. */
@@ -208,18 +262,22 @@ async function settingsOrDefaults(): Promise<Settings> {
 }
 
 /**
- * Reads the subreddit's newest posts (Reddit lists at most 1000), records the
- * ones that are up, and erases the ones that are not: those the list shows as
- * removed, and those that are recorded but missing from it, which is how a
- * post shows that was deleted without the app being told.
+ * Reads the subreddit's newest posts (Reddit lists at most 1000) and brings
+ * what the app has recorded in line with it. Posts that are up are recorded.
+ * Removed posts are erased, unless a moderator removed them and the subreddit
+ * wants those remembered. And a post that is recorded but missing from the
+ * list is erased: that is how a post shows that was deleted without the app
+ * being told.
  */
 async function rescan(current: Settings): Promise<{ recorded: number; erased: number }> {
   const subredditName = context.subredditName;
   const startedAt = Date.now();
   const oldest = startedAt - current.cooldownDays * DAY_MS;
   const posts: IncomingPost[] = [];
-  const up = new Set<string>();
-  const gone: string[] = [];
+  /** The posts in the list that may stay recorded. */
+  const staying = new Set<string>();
+  const removed: string[] = [];
+  const deleted: string[] = [];
   // How far back the list was read. Nothing is concluded about older posts.
   let readBackTo = Infinity;
   // The listing is newest first, so reading stops at the first post that is past the cooldown.
@@ -230,15 +288,21 @@ async function rescan(current: Settings): Promise<{ recorded: number; erased: nu
       break;
     }
     readBackTo = Math.min(readBackTo, createdAt);
-    if (isGone(post)) {
-      gone.push(post.id);
-    } else {
+    const state = stateOf(post);
+    if (state === 'up') {
       posts.push(fromReddit(post));
-      up.add(post.id);
+      staying.add(post.id);
+    } else if (state === 'removed') {
+      removed.push(post.id);
+    } else {
+      deleted.push(post.id);
     }
   }
-  let erased = await forgetPosts(gone, deps());
-  erased += await forgetUnlisted(up, readBackTo, startedAt - LISTING_LAG_MS, deps());
+  let erased = await forgetPosts(deleted, deps());
+  const sorted = await forgetRemoved(removed, current, deps());
+  erased += sorted.erased;
+  for (const id of sorted.kept) staying.add(id);
+  erased += await forgetUnlisted(staying, readBackTo, startedAt - LISTING_LAG_MS, deps());
   const recorded = await indexExistingPosts(posts, current, deps());
   return { recorded, erased };
 }
@@ -286,6 +350,40 @@ async function route(req: IncomingMessage): Promise<object | undefined> {
       const response: UiResponse = {
         showToast: { text: `Repost Cooldown now knows ${recorded} recent posts.`, appearance: 'success' },
       };
+      return response;
+    }
+    case '/internal/menu/erase': {
+      await readJson<MenuItemRequest>(req);
+      // Nothing is erased yet: the moderator is asked first, and the form's answer goes to the next endpoint.
+      const response: UiResponse = {
+        showForm: {
+          name: ERASE_FORM,
+          form: {
+            title: 'Erase what Repost Cooldown has stored?',
+            description:
+              `This erases everything the app has stored for r/${context.subredditName}: the fingerprints of ` +
+              'recent posts and its notes about them. It cannot be undone. The app stays switched on: it records ' +
+              'new posts as they come in, and reads the existing ones again at its next daily check or when you ' +
+              'pick "rescan recent posts". What an earlier version of the app stored, and this one cannot find, ' +
+              'expires by itself.',
+            fields: [{ type: 'boolean', name: 'confirm', label: 'Yes, erase it all', defaultValue: false }],
+            acceptLabel: 'Erase',
+            cancelLabel: 'Cancel',
+          },
+        },
+      };
+      return response;
+    }
+    case '/internal/form/erase': {
+      const answer = await readJson<{ confirm?: unknown }>(req);
+      let response: UiResponse = { showToast: 'Nothing was erased: the box was not ticked.' };
+      if (answer.confirm === true) {
+        const erased = await eraseEverything(deps());
+        log(`a moderator erased everything stored for r/${context.subredditName}: ${erased} entries`);
+        response = {
+          showToast: { text: `Repost Cooldown erased everything it had stored (${erased} entries).`, appearance: 'success' },
+        };
+      }
       return response;
     }
     default:

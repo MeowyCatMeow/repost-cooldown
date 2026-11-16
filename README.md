@@ -6,7 +6,7 @@ When someone crossposts a post from your own subreddit, the app checks how old t
 
 The app also catches regular reposts: if a new post shares the same link, title or text as a post made in your sub within the last 30 days, it's removed.
 
-A post only counts as an original while it is up. Once it is deleted or removed, the app forgets it, and it can be posted again.
+If the original's author deleted it, the app forgets it and it can be posted again. If a moderator removed it, the same goes, unless you switch on the option that keeps such a post counting as the original.
 
 Older posts are fine to share again once the cooldown is over.
 
@@ -23,17 +23,32 @@ You can test how the app behaves in its test subreddit, r/repost_cooldown_dev. P
 
 A post that the app removes gets a stickied comment that links to the original, and a mod note saying which post it repeated.
 
-## Deleted and removed posts
-
-Reddit's rules for apps say that an app must forget a post once it is deleted or removed. Repost Cooldown does, whoever took the post down:
+## When the original was removed or deleted
 
 | What happened to the original | Posting it again within the cooldown |
 | --- | --- |
 | Its author deleted it | Allowed |
-| A moderator, AutoModerator, Reddit or another app removed it | Allowed |
-| It was removed, and a moderator then approved it | Removed, because the original is up again |
+| Reddit took it down | Allowed |
+| AutoModerator, Reddit's filters or another app removed it | Allowed |
+| A moderator removed it | Allowed, or removed if the option below is on |
+| A moderator removed it and later approved it | Removed, because the original is up again |
+| A moderator removed it, and its author then deleted it | Allowed, with or without the option |
 
-So the app cannot stop someone from posting again what a moderator removed. It only compares a new post with posts that are up.
+### The option for posts that a moderator removed
+
+In the app's settings there is a box: **Also remove reposts of posts that a moderator removed**. It is not ticked unless you tick it.
+
+With it ticked, a post that a moderator removes keeps counting as the original until its cooldown ends, for 30 days at most. A moderator removes a post for a reason, so posting it again is removed too. The repost gets its own comment, which says that the moderators removed the earlier post.
+
+Only a removal made by a person counts. AutoModerator, Reddit's filters and other apps often remove a post because of who posted it or how often, so the same post from someone else is left alone. A removal that a moderator makes through another app counts as that app's. A bot that runs under an ordinary account looks like a person, so name such accounts in the settings to leave their removals out.
+
+Deleting ends it. Reddit's rules for apps say that an app must forget a post once its author deletes it, and that holds even when a moderator removed the post first. So someone can delete a removed post and post it again, and the app cannot stop that. Reddit does not tell the app when a removed post is deleted; the app finds out when the same thing is posted again, or at its daily check.
+
+If you remove a post for something its author can fix, such as a missing flair, and they post it again, the app removes the new post. Approve it to let it through.
+
+The option covers removals made while it is ticked. Untick it, and the app forgets the removed posts it was remembering: the recent ones at its next daily check, any older one within 30 days.
+
+### Approving a post the app removed
 
 When a moderator approves a post that the app removed, the post stays up and the app deletes its own comment from it.
 
@@ -45,9 +60,29 @@ When a post is edited, the app reads it again. A link or text that was edited ou
 
 To recognise a repost, the app keeps a fingerprint of each recent post's title, text and links, with the post's ID and the time it was made. A fingerprint is a one-way code: it cannot be turned back into the words or the link. The app keeps no usernames and no copies of posts.
 
-A post's fingerprints are erased when the post is deleted or removed, replaced when it is edited, and otherwise expire when its cooldown ends.
+How long it keeps them:
 
-Reddit tells the app about deletions and removals as they happen, but not about every one of them. So once a day the app also reads Reddit's list of the subreddit's newest posts and erases whatever it has recorded that is no longer up there. And nothing is kept for more than 30 days unless the app has read the post again and found it still up, which is the limit Reddit recommends.
+| The post | Its fingerprints |
+| --- | --- |
+| Is up | Kept until its cooldown ends |
+| Was deleted by its author, or taken down by Reddit | Erased |
+| Was removed by AutoModerator, a filter or another app | Erased |
+| Was removed by a moderator | Erased. With the option ticked: kept until its cooldown ends, a moderator approves it or its author deletes it, and for 30 days at most after the removal |
+| Was edited | What it no longer contains is erased |
+
+Reddit tells the app about most of these as they happen, and the app erases at once. It does not tell the app about all of them. So once a day the app also reads Reddit's list of the subreddit's newest posts and erases whatever it has recorded that should no longer be there. And nothing is kept for more than 30 days after the app last read the post and found it up, which is the limit Reddit recommends.
+
+### Erasing everything
+
+Moderators can erase everything the app has stored for the subreddit from the subreddit menu: **Repost Cooldown: erase stored data**. It asks first.
+
+The app stays switched on afterwards. It records new posts as they come in, and reads the existing ones again at its next daily check or when you pick the rescan. It no longer knows which removal comments it left before, so approving a post it removed earlier will not delete that comment.
+
+What a version of the app up to 0.0.21 stored, and the app can no longer find, is not covered. It expires by itself, at the latest when the cooldown of the post it belongs to ends. The one exception is a marker those versions kept for a post that a moderator removed: it holds nothing but the post's ID, and can last up to a year.
+
+### Uninstalling
+
+Reddit does not tell an app that it is being uninstalled, so the app cannot erase anything at that moment. Reddit's own guidance for moderators says that an uninstalled app's data and settings are lost and cannot be got back by installing it again. To be certain, erase the stored data first and then uninstall.
 
 ## What is left alone
 
@@ -67,6 +102,8 @@ Moderators can change these from the app's settings page in the subreddit:
 | Setting | Default |
 | --- | --- |
 | Cooldown (days) | 30 |
+| Also remove reposts of posts that a moderator removed | off |
+| Moderator accounts whose removals are not counted (used with the option above) | none |
 | Remove crossposts of posts from this subreddit | on |
 | Remove posts that share a link with a recent post | on |
 | Compare links inside a post's text when it has at most this many | 5 |
@@ -77,6 +114,7 @@ Moderators can change these from the app's settings page in the subreddit:
 | Never remove posts made by moderators | on |
 | Leave a stickied comment explaining the removal | on |
 | Removal comment | editable text |
+| Removal comment when the original was removed by a moderator | editable text |
 
 A shorter cooldown applies at once. A longer one is only certain to cover posts made after the change; older posts may be forgotten at the old limit.
 

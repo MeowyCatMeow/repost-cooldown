@@ -9,28 +9,42 @@
  *   fp:text:<hash>   -> {"id","at"}    the post that currently owns this body text
  *   post:<id>        -> {"at","keys"}  a known post and every fingerprint it may own
  *   seen:<id>        -> a token        the post's submit event is being, or was, handled
- *   gone:<id>        -> "1"            the post was deleted or removed; nothing about it may be recorded
+ *   gone:<id>        -> "1"            the post was deleted, or removed in a way that does not count; nothing about it may be recorded
+ *   removed:<id>     -> "1"            a moderator removed the post; it is still on Reddit and still counts as an original
  *   comment:<id>     -> a comment id   the removal comment the app left on a post it removed
  *   recorded         -> a sorted set   the ids of the posts that have a record, by the time they were made
+ *   keys             -> a sorted set   the name of every key above that the app has written
  *
  * Nothing here names a person, and no title, text or link is kept: a
- * fingerprint is a one-way hash. Reddit's rules for apps (Devvit Rules,
- * "Enable and respect user deletions"; Developer Terms 3.3) say that what an
- * app keeps about a post must go once the post is deleted, removed or edited,
- * and that includes anything made from it. So the fingerprints of a post are
- * erased when it is deleted or removed, by anyone (forgetPost), and replaced
- * when it is edited.
+ * fingerprint is a one-way hash.
  *
- * Not every such event arrives. Reddit sends none, for one, when a post that
- * was once removed is later deleted by its author, even if a moderator
- * approved it in between. So nothing relies on the events alone:
- *   - A daily pass reads Reddit's list of the subreddit's newest posts, erases
- *     the ones it shows as removed (forgetPosts), erases every recorded post
- *     that should be in the list and is not (forgetUnlisted), and reads the
- *     others again (indexExistingPosts).
- *   - Every key expires on its own, once its post is older than the cooldown
- *     and never more than 30 days after the app last read the post from Reddit
- *     and found it up, which is the limit Reddit recommends.
+ * What is kept, and until when:
+ *   - A post that is up is recorded until its cooldown ends.
+ *   - A post that a moderator, a person, removed stays recorded, so that
+ *     posting it again is removed too, but only in a subreddit whose
+ *     moderators have switched that option on. The post is still on Reddit,
+ *     only no longer shown in the subreddit. With the option off, which is
+ *     how it comes, such a post is erased like any other removed post.
+ *   - A post that its author deleted, or that Reddit took down, is erased at
+ *     once (forgetPost), option or no option. So is one removed by
+ *     AutoModerator, a filter or another app.
+ *   - An edited post is read again, and what it no longer has is erased.
+ *   - Nothing outlives 30 days from the last time the app read the post from
+ *     Reddit and found it up, the longest Reddit recommends. So a post that a
+ *     moderator removed is forgotten 30 days after that at the latest.
+ *
+ * The erasing is what Reddit's rules for apps require (Devvit Rules, "Enable
+ * and respect user deletions"; Developer Terms 3.3). Not every event arrives,
+ * though. Reddit sends none when a post that was once removed is later deleted
+ * by its author, even if a moderator approved it in between. So nothing relies
+ * on events alone: a daily pass reads Reddit's list of the subreddit's newest
+ * posts, erases the removed ones that no moderator removed (forgetRemoved),
+ * erases every recorded post that should be in the list and is not
+ * (forgetUnlisted), and reads the others again (indexExistingPosts).
+ *
+ * Every key is put on the `keys` list before it is written, because Reddit
+ * gives an app no way to list its own keys. That is what lets a moderator
+ * erase everything the app has stored (eraseEverything).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -60,9 +74,15 @@ const LATE_EVENT_MS = 2 * DAY_MS;
 const BATCH = 25;
 /** The sorted set that lists the posts with a record: the only way to find them without knowing their ids. */
 const RECORDED = 'recorded';
+/** The sorted set that lists every key the app has written, by the time the key is certain to be gone. */
+const KEYS = 'keys';
 
 export type Settings = {
   cooldownDays: number;
+  /** A post that a moderator removed still counts as an original. */
+  checkRemovedPosts: boolean;
+  /** Lowercase names of moderator accounts whose removals do not count: bots that run as ordinary accounts. */
+  ignoredRemovers: string[];
   checkCrossposts: boolean;
   checkLinks: boolean;
   /** Links inside a post's text are compared when it has at most this many; 0 turns that off. */
@@ -74,6 +94,8 @@ export type Settings = {
   exemptModerators: boolean;
   leaveComment: boolean;
   removalMessage: string;
+  /** The comment left when the original is a post that a moderator removed. */
+  removedOriginalMessage: string;
 };
 
 export const DEFAULT_REMOVAL_MESSAGE =
@@ -82,8 +104,18 @@ export const DEFAULT_REMOVAL_MESSAGE =
   '*I am a bot. If you think this was a mistake, please ' +
   '[message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*';
 
+export const DEFAULT_REMOVED_ORIGINAL_MESSAGE =
+  'Hi u/{author}, your post was removed because it repeats [an earlier post]({original}) ' +
+  'that the moderators of r/{subreddit} removed.\n\n' +
+  'Please do not post it again.\n\n' +
+  '*I am a bot. If you think this was a mistake, please ' +
+  '[message the moderators](https://www.reddit.com/message/compose?to=r/{subreddit}).*';
+
 export const DEFAULT_SETTINGS: Settings = {
   cooldownDays: 30,
+  // An option the moderators switch on themselves.
+  checkRemovedPosts: false,
+  ignoredRemovers: [],
   checkCrossposts: true,
   checkLinks: true,
   maxTextLinks: 5,
@@ -94,6 +126,7 @@ export const DEFAULT_SETTINGS: Settings = {
   exemptModerators: true,
   leaveComment: true,
   removalMessage: DEFAULT_REMOVAL_MESSAGE,
+  removedOriginalMessage: DEFAULT_REMOVED_ORIGINAL_MESSAGE,
 };
 
 /** Turns the raw values of the app's settings form into `Settings`. */
@@ -107,9 +140,22 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     if (raw?.[name] == null || raw[name] === '' || !Number.isFinite(value)) return DEFAULT_SETTINGS[name] as number;
     return Math.min(max, Math.max(min, value));
   };
-  const message = raw?.removalMessage;
+  const text = (name: 'removalMessage' | 'removedOriginalMessage'): string => {
+    const value = raw?.[name];
+    return typeof value === 'string' && value.trim() ? value : DEFAULT_SETTINGS[name];
+  };
+  // "u/Name, other-name" to ["name", "other-name"].
+  const names = (value: unknown): string[] =>
+    typeof value === 'string'
+      ? value
+          .split(/[\s,]+/)
+          .map((name) => name.replace(/^\/?u\//i, '').toLowerCase())
+          .filter(Boolean)
+      : [];
   return {
     cooldownDays: num('cooldownDays', 1, MAX_COOLDOWN_DAYS),
+    checkRemovedPosts: bool('checkRemovedPosts'),
+    ignoredRemovers: names(raw?.ignoredRemovers),
     checkCrossposts: bool('checkCrossposts'),
     checkLinks: bool('checkLinks'),
     maxTextLinks: num('maxTextLinks', 0, 100),
@@ -119,7 +165,8 @@ export function parseSettings(raw: Record<string, unknown> | undefined): Setting
     minTextLength: num('minTextLength', 0, 40000),
     exemptModerators: bool('exemptModerators'),
     leaveComment: bool('leaveComment'),
-    removalMessage: typeof message === 'string' && message.trim() ? message : DEFAULT_REMOVAL_MESSAGE,
+    removalMessage: text('removalMessage'),
+    removedOriginalMessage: text('removedOriginalMessage'),
   };
 }
 
@@ -128,12 +175,22 @@ export interface Store {
   get(key: string): Promise<string | undefined | null>;
   set(key: string, value: string, options?: { nx?: boolean; expiration?: Date }): Promise<unknown>;
   del(...keys: string[]): Promise<unknown>;
+  /** How many of the keys exist. */
+  exists(...keys: string[]): Promise<number>;
   zAdd(key: string, ...members: Array<{ member: string; score: number }>): Promise<unknown>;
-  /** The members whose score is from `min` to `max`. */
-  zRange(key: string, min: number, max: number, options: { by: 'score' }): Promise<Array<{ member: string; score: number }>>;
+  /** By score: the members whose score is from `start` to `stop`. By rank: the members at those positions, lowest score first. */
+  zRange(
+    key: string,
+    start: number,
+    stop: number,
+    options: { by: 'score' | 'rank' }
+  ): Promise<Array<{ member: string; score: number }>>;
   zRem(key: string, members: string[]): Promise<unknown>;
   zRemRangeByScore(key: string, min: number, max: number): Promise<unknown>;
 }
+
+/** Up, removed (also: marked as spam, or held back by a filter), or deleted by its author. */
+export type PostState = 'up' | 'removed' | 'deleted';
 
 /** What the app needs to know about an existing post. */
 export type PostInfo = {
@@ -141,8 +198,7 @@ export type PostInfo = {
   subredditId: string;
   /** Milliseconds since the epoch. */
   createdAt: number;
-  /** Removed, marked as spam, filtered, or deleted by its author. */
-  removed: boolean;
+  state: PostState;
   permalink?: string;
 };
 
@@ -150,8 +206,11 @@ export type PostInfo = {
 export interface RedditGateway {
   /** Throws when the post cannot be read. */
   getPostInfo(id: string): Promise<PostInfo>;
-  /** The post as it is on Reddit now, or `undefined` when it is deleted or removed. Throws when it cannot be read. */
-  getPost(id: string): Promise<IncomingPost | undefined>;
+  /**
+   * The post as it is on Reddit now. A moderator can still read a removed
+   * post; a deleted one has nothing left to read. Throws when it cannot be read.
+   */
+  getPost(id: string): Promise<{ state: PostState; post: IncomingPost }>;
   isModerator(username: string): Promise<boolean>;
   remove(id: string): Promise<void>;
   /** Posts a comment on the post, as a stickied moderator comment, and returns the comment's id. */
@@ -190,13 +249,17 @@ export type Reason = 'crosspost' | 'link' | 'text' | 'title';
 
 export type Fingerprint = { kind: 'link' | 'text' | 'title'; key: string };
 
-/** `gone` means the post repeats nothing, and was deleted or removed before the app got to it, so it is not recorded. */
+/**
+ * `gone` means the post repeats nothing, and was deleted or removed before the
+ * app got to it, so it is not recorded. `originalRemoved` is set when the
+ * original is a post that a moderator removed.
+ */
 export type Outcome =
   | { action: 'duplicate-event' }
   | { action: 'gone' }
   | { action: 'indexed'; compared: Array<Fingerprint['kind']> }
-  | { action: 'exempt'; reason: Reason; originalId: string }
-  | { action: 'removed'; reason: Reason; originalId: string };
+  | { action: 'exempt'; reason: Reason; originalId: string; originalRemoved?: true }
+  | { action: 'removed'; reason: Reason; originalId: string; originalRemoved?: true };
 
 type Entry = { id: string; at: number };
 type PostRecord = { at: number; keys: string[] };
@@ -340,15 +403,37 @@ async function isExempt(post: IncomingPost, settings: Settings, deps: Deps): Pro
   }
 }
 
+/**
+ * Puts keys on the list of everything the app has written. This is done before
+ * a key is written, so that no key can exist without being on the list.
+ */
+async function listKeys(names: string[], deps: Pick<Deps, 'store' | 'now'>): Promise<void> {
+  if (names.length === 0) return;
+  // No key is kept for longer than RETENTION_MS after it is written, so by
+  // this time it is gone, unless it is written again and listed again.
+  const gone = deps.now() + RETENTION_MS + DAY_MS;
+  await deps.store.zAdd(KEYS, ...names.map((member) => ({ member, score: gone })));
+}
+
+/** Takes keys that were erased off that list. */
+async function unlistKeys(names: string[], store: Store): Promise<void> {
+  if (names.length > 0) await store.zRem(KEYS, names);
+}
+
 /** Erases the fingerprints in `keys` that belong to the post, or to no post that can be read. */
 async function release(id: string, keys: Iterable<string>, store: Store): Promise<void> {
+  const erased: string[] = [];
   for (const key of keys) {
     const value = await store.get(key);
     if (!value) continue;
     // Another post may have taken the fingerprint over; that one keeps it.
     const owner = readEntry(value);
-    if (!owner || owner.id === id) await store.del(key);
+    if (!owner || owner.id === id) {
+      await store.del(key);
+      erased.push(key);
+    }
   }
+  await unlistKeys(erased, store);
 }
 
 /**
@@ -385,6 +470,7 @@ async function indexPost(
   // leaves no fingerprint that the record does not name.
   const before = readRecord(await store.get(recordKey));
   if (before) await release(post.id, before.keys.filter((key) => !current.has(key)), store);
+  await listKeys([recordKey, ...current], deps);
   const record: PostRecord = { at: post.createdAt, keys: [...current] };
   await store.set(recordKey, JSON.stringify(record), { expiration });
   await store.zAdd(RECORDED, { member: post.id, score: post.createdAt });
@@ -405,6 +491,7 @@ async function indexPost(
     // written, so they are erased by name rather than through the record.
     await release(post.id, current, store);
     await store.del(recordKey);
+    await unlistKeys([recordKey], store);
     await store.zRem(RECORDED, [post.id]);
     return false;
   }
@@ -424,6 +511,7 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
   // goes on, so a post is never removed and commented on twice.
   const seenKey = `seen:${post.id}`;
   const token = randomUUID();
+  await listKeys([seenKey], deps);
   await store.set(seenKey, token, { nx: true, expiration: new Date(deps.now() + LATE_EVENT_MS) });
   if ((await store.get(seenKey)) !== token) return { action: 'duplicate-event' };
 
@@ -474,6 +562,8 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     const replaceable = new Set<string>();
     let match: Candidate | undefined;
+    /** The original is a post that a moderator removed. */
+    let originalRemoved = false;
     for (const candidate of candidates) {
       if (candidate.id === post.id) continue;
       // With the crosspost check switched off, crossposts are allowed: one is
@@ -485,25 +575,38 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
         continue;
       }
       if (age < 0) continue;
-      // Only a post that is still up counts as an original. When that cannot be
+      // A post that is up counts as an original, and so does one that a
+      // moderator removed, when the subreddit wants that. When neither can be
       // confirmed, leave the new post alone rather than remove it on a guess.
       const info = await getInfo(candidate.id);
       if (!info) continue;
-      if (info.removed) {
-        // Deleted or removed, and the event that said so never arrived: erase it now.
-        await forgetPost(candidate.id, deps);
-        if (candidate.key) replaceable.add(candidate.key);
-        continue;
+      const removedKey = `removed:${candidate.id}`;
+      if (info.state === 'up') {
+        // A mark that a moderator once removed it is out of date: the approval was missed.
+        if (await store.get(removedKey)) {
+          await store.del(removedKey);
+          await unlistKeys([removedKey], store);
+        }
+        match = candidate;
+        break;
       }
-      match = candidate;
-      break;
+      if (info.state === 'removed' && settings.checkRemovedPosts && (await store.get(removedKey))) {
+        match = candidate;
+        originalRemoved = true;
+        break;
+      }
+      // Deleted by its author, whatever happened to it before, or removed by
+      // AutoModerator, a filter or another app: it is erased, here and now if
+      // the event that said so never arrived.
+      await forgetPost(candidate.id, deps);
+      if (candidate.key) replaceable.add(candidate.key);
     }
 
     if (!match) {
       const kept = !gone && (await indexPost(post, prints, cooldownMs, deps, { replaceable }));
       return kept ? { action: 'indexed', compared: [...new Set(prints.map((print) => print.kind))] } : { action: 'gone' };
     }
-    const found = { reason: match.reason, originalId: match.id };
+    const found = { reason: match.reason, originalId: match.id, ...(originalRemoved ? { originalRemoved: true as const } : {}) };
 
     if (await isExempt(post, settings, deps)) {
       if (!gone) await indexPost(post, prints, cooldownMs, deps, { replaceable });
@@ -514,7 +617,8 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     const ageMs = post.createdAt - match.at;
     if (settings.leaveComment) {
-      const text = renderRemovalMessage(settings.removalMessage, {
+      const template = originalRemoved ? settings.removedOriginalMessage : settings.removalMessage;
+      const text = renderRemovalMessage(template, {
         author: post.authorName,
         reason: match.reason,
         original: permalinkOf(infoCache.get(match.id), match.id),
@@ -526,8 +630,10 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
         const commentId = await reddit.comment(post.id, text);
         // Remembered so that the comment can be taken off if a moderator approves the post after all.
         if (commentId) {
+          const commentKey = `comment:${post.id}`;
           const keptFor = Math.min(cooldownMs + HOUR_MS, RETENTION_MS);
-          await store.set(`comment:${post.id}`, commentId, { expiration: new Date(deps.now() + keptFor) });
+          await listKeys([commentKey], deps);
+          await store.set(commentKey, commentId, { expiration: new Date(deps.now() + keptFor) });
         }
       } catch (error) {
         deps.log?.(`removed ${post.id} but could not comment: ${String(error)}`);
@@ -536,7 +642,8 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
     try {
       // Mod notes are limited to 100 characters.
       const what = match.reason === 'crosspost' ? 'crosspost of' : `same ${match.reason} as`;
-      await reddit.addRemovalNote(post.id, `Repost Cooldown: ${what} ${match.id}, made ${formatAge(ageMs)}`);
+      const which = originalRemoved ? `${match.id} (removed by a mod)` : match.id;
+      await reddit.addRemovalNote(post.id, `Repost Cooldown: ${what} ${which}, made ${formatAge(ageMs)}`);
     } catch (error) {
       deps.log?.(`removed ${post.id} but could not add a removal note: ${String(error)}`);
     }
@@ -544,15 +651,16 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
   } catch (error) {
     // Let a redelivered event try again.
     await store.del(seenKey);
+    await unlistKeys([seenKey], store);
     throw error;
   }
 }
 
 /**
- * Erases everything the app keeps about a post that was deleted or removed,
- * whoever did it: its author, a moderator, AutoModerator, another app or
- * Reddit. The post no longer counts as an original, so what it contained can
- * be posted again. Returns whether the post was recorded.
+ * Erases everything the app keeps about a post, for good: the post was
+ * deleted by its author or taken down by Reddit, or it was removed in a way
+ * that does not count as a moderator's decision. It is no longer an original,
+ * so what it contained can be posted again. Returns whether it was recorded.
  */
 export async function forgetPost(rawId: string, deps: Pick<Deps, 'store' | 'now'>): Promise<boolean> {
   const id = toPostId(rawId);
@@ -560,17 +668,20 @@ export async function forgetPost(rawId: string, deps: Pick<Deps, 'store' | 'now'
   const { store } = deps;
   // Written before anything is erased: whatever is recording this post at the
   // same moment looks for this after its last write, and erases what it wrote.
-  await store.set(`gone:${id}`, '1', { expiration: new Date(deps.now() + LATE_EVENT_MS) });
+  const goneKey = `gone:${id}`;
+  await listKeys([goneKey], deps);
+  await store.set(goneKey, '1', { expiration: new Date(deps.now() + LATE_EVENT_MS) });
   const recordKey = `post:${id}`;
+  const removedKey = `removed:${id}`;
   const record = readRecord(await store.get(recordKey));
   if (record) await release(id, record.keys, store);
-  // A "removed:" mark is something earlier versions of the app kept.
-  await store.del(recordKey, `removed:${id}`);
+  await store.del(recordKey, removedKey);
+  await unlistKeys([recordKey, removedKey], store);
   await store.zRem(RECORDED, [id]);
   return record !== undefined;
 }
 
-/** Erases many deleted or removed posts. Returns how many of them were recorded. */
+/** Erases many posts for good. Returns how many of them were recorded. */
 export async function forgetPosts(ids: string[], deps: Pick<Deps, 'store' | 'now'>): Promise<number> {
   let recorded = 0;
   for (let i = 0; i < ids.length; i += BATCH) {
@@ -578,6 +689,108 @@ export async function forgetPosts(ids: string[], deps: Pick<Deps, 'store' | 'now
     recorded += results.filter(Boolean).length;
   }
   return recorded;
+}
+
+/**
+ * Deals with the posts that Reddit lists as removed. One that a moderator
+ * removed stays recorded, as long as the subreddit wants that and its record
+ * has not run out; the others are erased. Returns the ids that stay, and how
+ * many recorded posts were erased.
+ */
+export async function forgetRemoved(
+  ids: string[],
+  settings: Settings,
+  deps: Pick<Deps, 'store' | 'now'>
+): Promise<{ kept: string[]; erased: number }> {
+  const { store } = deps;
+  const kept: string[] = [];
+  let erased = 0;
+  for (let i = 0; i < ids.length; i += BATCH) {
+    await Promise.all(
+      ids.slice(i, i + BATCH).map(async (id) => {
+        const remembered =
+          settings.checkRemovedPosts && (await store.get(`removed:${id}`)) && (await store.get(`post:${id}`));
+        if (remembered) kept.push(id);
+        else if (await forgetPost(id, deps)) erased++;
+      })
+    );
+  }
+  return { kept, erased };
+}
+
+/**
+ * A moderator, a person, removed a post. The post is still on Reddit, only no
+ * longer shown in the subreddit, and it stays recorded so that posting it
+ * again is removed too. That ends when its cooldown ends, when a moderator
+ * approves it, or when its author deletes it, and 30 days after this at the
+ * latest. Returns whether the post is now remembered as removed.
+ *
+ * Call this only when the subreddit has the rule switched on.
+ */
+export async function handlePostRemovedByModerator(rawId: string, settings: Settings, deps: Deps): Promise<boolean> {
+  const id = toPostId(rawId);
+  if (!id) return false;
+  const { store, reddit } = deps;
+  const now = deps.now();
+  const cooldownMs = settings.cooldownDays * DAY_MS;
+  const goneKey = `gone:${id}`;
+
+  let madeAt = readRecord(await store.get(`post:${id}`))?.at;
+  if (madeAt === undefined) {
+    // Not recorded: a filter held it back when it came in, or the app never
+    // saw it. A moderator can still read it, so it is read from Reddit.
+    let found: Awaited<ReturnType<RedditGateway['getPost']>>;
+    try {
+      found = await reddit.getPost(id);
+    } catch (error) {
+      deps.log?.(`${id} was removed by a moderator but could not be read, so it is not remembered: ${String(error)}`);
+      return false;
+    }
+    if (found.state === 'deleted') await forgetPost(id, deps);
+    if (found.state !== 'removed' || found.post.createdAt + cooldownMs <= now) return false;
+    await store.del(goneKey);
+    await unlistKeys([goneKey], store);
+    if (!(await indexPost(found.post, fingerprintsOf(found.post, settings), cooldownMs, deps))) return false;
+    madeAt = found.post.createdAt;
+  }
+
+  const expiresAt = Math.min(madeAt + cooldownMs + HOUR_MS, now + RETENTION_MS);
+  if (expiresAt <= now) return false;
+  const removedKey = `removed:${id}`;
+  await listKeys([removedKey], deps);
+  await store.set(removedKey, '1', { expiration: new Date(expiresAt) });
+  // Its author may have deleted it at this very moment. Then nothing stays.
+  if (await store.get(goneKey)) {
+    await store.del(removedKey);
+    await unlistKeys([removedKey], store);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Erases everything the app has stored for the subreddit: every key on the
+ * list of keys it has written, then the lists themselves. Returns how many
+ * keys there were to erase.
+ *
+ * It does not switch the app off. A post that comes in afterwards is recorded
+ * as usual, and the next daily pass records the posts that are up.
+ */
+export async function eraseEverything(deps: Pick<Deps, 'store'>): Promise<number> {
+  const { store } = deps;
+  const PAGE = 500;
+  let erased = 0;
+  // Each round takes the first names off the list, so this ends when it is empty.
+  for (let round = 0; round < 100_000; round++) {
+    const names = (await store.zRange(KEYS, 0, PAGE - 1, { by: 'rank' })).map((entry) => entry.member);
+    if (names.length === 0) break;
+    erased += await store.exists(...names);
+    await store.del(...names);
+    await store.zRem(KEYS, names);
+  }
+  erased += await store.exists(RECORDED);
+  await store.del(RECORDED, KEYS);
+  return erased;
 }
 
 /**
@@ -609,23 +822,54 @@ export async function forgetUnlisted(
  * Re-reads a post that was edited: gives up what it no longer contains and
  * records what it contains now, so that nothing is kept of a link or text
  * that is no longer there. An edit never gets a post removed. Returns whether
- * the post is one the app keeps track of.
+ * the post was read again.
+ *
+ * `textUnchanged` says that the event shows the same text before and after.
+ * The settings are only asked for when the post has to be read again.
  */
-export async function handlePostEdited(post: IncomingPost, settings: Settings, deps: Deps): Promise<boolean> {
-  // A post the app removed, one that was deleted or removed, one past the
-  // cooldown, or one it never saw has no record.
-  const record = readRecord(await deps.store.get(`post:${post.id}`));
+export async function handlePostEdited(
+  post: IncomingPost,
+  loadSettings: () => Promise<Settings>,
+  deps: Deps,
+  textUnchanged = false
+): Promise<boolean> {
+  const { store, reddit } = deps;
+  // A post the app removed, one that was erased, one past the cooldown, or one
+  // it never saw has no record.
+  const record = readRecord(await store.get(`post:${post.id}`));
   if (!record) return false;
+
+  let edited = post;
+  if (await store.get(`removed:${post.id}`)) {
+    // A moderator removed this post. Reddit may blank out the text of a
+    // removed post in the event, so the post is read from Reddit itself. If
+    // that fails there is no telling what the post says now, and it is erased
+    // rather than kept as it was.
+    const found = await reddit.getPost(post.id).catch((error: unknown) => {
+      deps.log?.(`${post.id} was edited but could not be read, so it is erased: ${String(error)}`);
+      return undefined;
+    });
+    if (!found || found.state === 'deleted') {
+      await forgetPost(post.id, deps);
+      return false;
+    }
+    edited = found.post;
+  } else if (textUnchanged) {
+    // A post's title and link cannot be edited, so nothing it is compared by has changed.
+    return false;
+  }
+  const settings = await loadSettings();
   // The post keeps the age it was recorded with; an edit does not restart its cooldown.
-  return indexPost({ ...post, createdAt: record.at }, fingerprintsOf(post, settings), settings.cooldownDays * DAY_MS, deps);
+  return indexPost({ ...edited, createdAt: record.at }, fingerprintsOf(edited, settings), settings.cooldownDays * DAY_MS, deps);
 }
 
 /**
- * A moderator approved a post, so it is up again. If the app had removed it as
- * a repost, the app's comment saying so is no longer true and is deleted. If
- * the post is not recorded, because it was erased when it was removed or was
- * never seen, it is read from Reddit and recorded: it counts as an original
- * from now on. An approved post is never removed.
+ * A moderator approved a post, so it is up again and an ordinary post: a mark
+ * that a moderator had removed it is dropped. If the app had removed it as a
+ * repost, the app's comment saying so is no longer true and is deleted. If the
+ * post is not recorded, because it was erased when it was removed or was never
+ * seen, it is read from Reddit and recorded: it counts as an original from now
+ * on. An approved post is never removed.
  *
  * The settings are only asked for when the post has to be recorded.
  */
@@ -633,11 +877,18 @@ export async function handlePostApproved(
   rawId: string,
   loadSettings: () => Promise<Settings>,
   deps: Deps
-): Promise<{ recorded: boolean; commentDeleted: boolean }> {
-  const result = { recorded: false, commentDeleted: false };
+): Promise<{ unmarked: boolean; recorded: boolean; commentDeleted: boolean }> {
+  const result = { unmarked: false, recorded: false, commentDeleted: false };
   const id = toPostId(rawId);
   if (!id) return result;
   const { store, reddit } = deps;
+
+  const removedKey = `removed:${id}`;
+  if (await store.get(removedKey)) {
+    await store.del(removedKey);
+    await unlistKeys([removedKey], store);
+    result.unmarked = true;
+  }
 
   const commentKey = `comment:${id}`;
   const commentId = await store.get(commentKey);
@@ -649,22 +900,27 @@ export async function handlePostApproved(
       deps.log?.(`${id} was approved but the removal comment could not be deleted: ${String(error)}`);
     }
     await store.del(commentKey);
+    await unlistKeys([commentKey], store);
   }
 
   // A moderator has decided the post stays, so a submit event for it that
   // arrives only now must not get it checked and removed.
-  await store.set(`seen:${id}`, 'approved', { expiration: new Date(deps.now() + LATE_EVENT_MS) });
+  const seenKey = `seen:${id}`;
+  await listKeys([seenKey], deps);
+  await store.set(seenKey, 'approved', { expiration: new Date(deps.now() + LATE_EVENT_MS) });
 
   if (readRecord(await store.get(`post:${id}`))) return result;
   // Asked of Reddit rather than taken from the event: the post may have been
   // removed again, or deleted, since it was approved.
-  const post = await reddit.getPost(id);
-  if (!post) return result;
+  const found = await reddit.getPost(id);
+  if (found.state !== 'up') return result;
   const settings = await loadSettings();
   const cooldownMs = settings.cooldownDays * DAY_MS;
-  if (post.createdAt + cooldownMs <= deps.now()) return result;
-  await store.del(`gone:${id}`);
-  result.recorded = await indexPost(post, fingerprintsOf(post, settings), cooldownMs, deps);
+  if (found.post.createdAt + cooldownMs <= deps.now()) return result;
+  const goneKey = `gone:${id}`;
+  await store.del(goneKey);
+  await unlistKeys([goneKey], store);
+  result.recorded = await indexPost(found.post, fingerprintsOf(found.post, settings), cooldownMs, deps);
   return result;
 }
 
@@ -704,7 +960,9 @@ export async function indexExistingPosts(posts: IncomingPost[], settings: Settin
     const results = await Promise.all(jobs.slice(i, i + BATCH).map((job) => job()));
     recorded += results.filter(Boolean).length;
   }
-  // The list of recorded posts does not expire by itself the way records do.
+  // The two lists do not expire by themselves the way keys do: entries for
+  // posts past the cooldown, and for keys that are certain to be gone, go here.
   await deps.store.zRemRangeByScore(RECORDED, 0, now - cooldownMs - DAY_MS);
+  await deps.store.zRemRangeByScore(KEYS, 0, now);
   return recorded;
 }

@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { registerHooks } from 'node:module';
 import type { AddressInfo } from 'node:net';
-import { after, beforeEach, test } from 'node:test';
+import { after, afterEach, beforeEach, test } from 'node:test';
 
 const fakeUrl = new URL('./fake-devvit.ts', import.meta.url).href;
 registerHooks({
@@ -31,6 +31,12 @@ after(() => {
   server.close();
 });
 beforeEach(() => reset());
+// Whatever a test did, every key the app wrote must be on its list of keys:
+// that list is what lets a moderator erase everything.
+afterEach(() => {
+  const listed = state.sorted.get('keys');
+  assert.deepEqual([...state.redis.keys()].filter((key) => !listed?.has(key)), []);
+});
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -143,42 +149,66 @@ function kept(id: string): string[] {
     .map(([key]) => key);
 }
 
-test('a post is erased when anyone removes it, and recorded again when a moderator approves it', async () => {
+test('a post removed by a person still counts; one removed by an app or a bot is erased', async () => {
+  // The moderators have ticked the option, and named a bot that runs under an ordinary account.
+  state.settings = { checkRemovedPosts: true, ignoredRemovers: 'u/Ordinary-Bot' };
   const cases = [
-    { title: 'A title removed by a person', action: 'removelink', remover: { name: 'modmary', accountType: 1 } },
-    { title: 'A title marked as spam by a person', action: 'spamlink', remover: { name: 'modmary', accountType: 'ACCOUNT_TYPE_USER' } },
-    { title: 'A title removed by another app', action: 'removelink', remover: { name: 'flood-assistant', accountType: 3 } },
-    { title: 'A title removed by AutoModerator', action: 'removelink', remover: { name: 'AutoModerator', accountType: 1 } },
+    { title: 'A title removed by a person', action: 'removelink', remover: { name: 'modmary', accountType: 1 }, counts: true },
+    { title: 'A title marked as spam by a person', action: 'spamlink', remover: { name: 'modmary', accountType: 'ACCOUNT_TYPE_USER' }, counts: true },
+    { title: 'A title removed by another app', action: 'removelink', remover: { name: 'flood-assistant', accountType: 3 }, counts: false },
+    { title: 'A title removed by AutoModerator', action: 'removelink', remover: { name: 'AutoModerator', accountType: 1 }, counts: false },
+    { title: 'A title removed by a named bot', action: 'removelink', remover: { name: 'ordinary-bot', accountType: 1 }, counts: false },
+    { title: 'A title removed by an unknown kind', action: 'removelink', remover: { name: 'someone', accountType: 0 }, counts: false },
   ];
   const originals: string[] = [];
-  for (const [index, { title, action, remover }] of cases.entries()) {
+  for (const [index, { title, action, remover, counts }] of cases.entries()) {
     const original = post({ title, url: `https://i.redd.it/original${index}.png` });
     await submit(original.event);
-    assert.equal(kept(original.id).length, 3);
     state.posts.get(original.id)!.removed = true;
+    // Reddit reports the removal as a delete event first. That alone decides nothing.
+    await call('/internal/triggers/post-delete', { type: 'PostDelete', postId: original.id, source: 3 });
+    assert.equal(kept(original.id).length, 3);
+    // The moderator action says who removed it.
     assert.equal((await modAction(action, original.id, remover)).status, 200);
-    assert.deepEqual(kept(original.id), [], title);
+    assert.equal(kept(original.id).length, counts ? 3 : 0, title);
+    assert.equal(state.redis.has(`removed:${original.id}`), counts, title);
     originals.push(original.id);
   }
-  // Something a moderator does that is not a removal erases nothing.
+  // Something a moderator does that is not a removal changes nothing.
   const locked = post({ title: 'A title on a post that gets locked', url: 'https://i.redd.it/locked.png' });
   await submit(locked.event);
   await modAction('lock', locked.id, cases[0]!.remover);
   assert.equal(kept(locked.id).length, 3);
+  assert.equal(state.redis.has(`removed:${locked.id}`), false);
 
-  // The removed posts no longer count as originals.
-  for (const [index, { title }] of cases.entries()) {
-    await submit(post({ title, url: `https://i.redd.it/again${index}.png`, author: 'bob' }).event);
+  const expected: string[] = [];
+  for (const [index, { title, counts }] of cases.entries()) {
+    const repost = post({ title, url: `https://i.redd.it/repost${index}.png`, author: 'bob' });
+    await submit(repost.event);
+    if (counts) expected.push(repost.id);
   }
-  assert.deepEqual(state.removed, []);
+  assert.deepEqual(state.removed, expected);
+  assert.match(state.comments[0]!.text, /that the moderators of r\/home removed/);
 
-  // A moderator approves the first one: it is read from Reddit and recorded again.
+  // Approving the removed post makes it an ordinary post again.
   state.posts.get(originals[0]!)!.removed = false;
   assert.equal((await modAction('approvelink', originals[0]!, cases[0]!.remover)).status, 200);
-  assert.equal(kept(originals[0]!).length, 2);
-  const repost = post({ title: 'Other words for the first picture', url: 'https://i.redd.it/original0.png', author: 'bob' });
-  await submit(repost.event);
-  assert.deepEqual(state.removed, [repost.id]);
+  assert.equal(state.redis.has(`removed:${originals[0]}`), false);
+  assert.equal(kept(originals[0]!).length, 3);
+});
+
+test('unless the option is ticked, a post that a moderator removes is erased like any removed post', async () => {
+  // The settings as the app comes: nothing changed by the moderators.
+  state.settings = {};
+  const original = post({ title: 'A title removed by a person', url: 'https://i.redd.it/original.png' });
+  await submit(original.event);
+  state.posts.get(original.id)!.removed = true;
+  await modAction('removelink', original.id, { name: 'modmary', accountType: 1 });
+  assert.deepEqual(kept(original.id), []);
+  assert.equal(state.redis.has(`removed:${original.id}`), false);
+
+  await submit(post({ title: 'A title removed by a person', url: 'https://i.redd.it/again.png', author: 'bob' }).event);
+  assert.deepEqual(state.removed, []);
 });
 
 test('approving a post the app removed deletes its removal comment', async () => {
@@ -201,13 +231,19 @@ test('approving a post the app removed deletes its removal comment', async () =>
   assert.deepEqual(state.removed, [repost.id]);
 });
 
-test('a delete event erases the post, whoever deleted or removed it', async () => {
-  // Reddit names who did it by number or by name, or not at all: the author, an admin, a moderator, unknown.
-  for (const source of [1, 'USER', 2, 'ADMIN', 3, 'MODERATOR', 0, undefined]) {
+test('a delete event erases the post when its author deleted it or Reddit took it down', async () => {
+  // Reddit names who did it by number or by name: the author, or Reddit itself.
+  for (const source of [1, 'USER', 2, 'ADMIN']) {
     const original = post({ title: `A title that will be deleted ${source}`, url: `https://i.redd.it/deleted${source}.png` });
     await submit(original.event);
     assert.equal(kept(original.id).length, 3);
-    const event = { type: 'PostDelete', postId: original.id, ...(source === undefined ? {} : { source }) };
+    // Even when a moderator had removed the post before, and the app was remembering it.
+    state.settings = { checkRemovedPosts: true };
+    state.posts.get(original.id)!.removed = true;
+    await modAction('removelink', original.id, { name: 'modmary', accountType: 1 });
+    assert.equal(state.redis.has(`removed:${original.id}`), true);
+
+    const event = { type: 'PostDelete', postId: original.id, source };
     assert.equal((await call('/internal/triggers/post-delete', event)).status, 200);
     assert.deepEqual(kept(original.id), [], String(source));
     assert.equal(state.sorted.get('recorded')!.has(original.id), false);
@@ -218,7 +254,50 @@ test('a delete event erases the post, whoever deleted or removed it', async () =
     const left = [...state.redis].filter(([key]) => key.endsWith(original.id)).map(([key, item]) => [key.split(':')[0], item.value]);
     assert.deepEqual(left.map(([kind]) => kind).sort(), ['gone', 'seen']);
     assert.equal(left.find(([kind]) => kind === 'gone')![1], '1');
+
+    // So the same thing can be posted again.
+    await submit(post({ title: `A title that will be deleted ${source}`, url: `https://i.redd.it/deleted${source}.png` }).event);
+    assert.deepEqual(state.removed, []);
   }
+});
+
+test('a delete event that reports a removal, or does not say who did it, is not taken for a deletion', async () => {
+  const deleteEvent = (id: string, source?: number | string) =>
+    call('/internal/triggers/post-delete', { type: 'PostDelete', postId: id, ...(source === undefined ? {} : { source }) });
+
+  // A moderator's removal: the moderator action that follows decides.
+  for (const source of [3, 'MODERATOR']) {
+    const removed = post({ title: `A title removed by a moderator ${source}`, url: `https://i.redd.it/removed${source}.png` });
+    await submit(removed.event);
+    state.posts.get(removed.id)!.removed = true;
+    assert.equal((await deleteEvent(removed.id, source)).status, 200);
+    assert.equal(kept(removed.id).length, 3, String(source));
+  }
+
+  // No word on who did it: the app looks at what became of the post.
+  const stillRemoved = post({ title: 'A title on a post that is removed', url: 'https://i.redd.it/still-removed.png' });
+  await submit(stillRemoved.event);
+  state.posts.get(stillRemoved.id)!.removed = true;
+  await deleteEvent(stillRemoved.id, 0);
+  assert.equal(kept(stillRemoved.id).length, 3);
+
+  const stillUp = post({ title: 'A title on a post that is still up', url: 'https://i.redd.it/still-up.png' });
+  await submit(stillUp.event);
+  await deleteEvent(stillUp.id);
+  assert.equal(kept(stillUp.id).length, 3);
+
+  const deleted = post({ title: 'A title on a post that was deleted', url: 'https://i.redd.it/was-deleted.png' });
+  await submit(deleted.event);
+  state.posts.get(deleted.id)!.authorName = '[deleted]';
+  await deleteEvent(deleted.id, 0);
+  assert.deepEqual(kept(deleted.id), []);
+
+  // A post that Reddit can no longer show at all is treated as deleted.
+  const vanished = post({ title: 'A title on a post that vanished', url: 'https://i.redd.it/vanished.png' });
+  await submit(vanished.event);
+  state.posts.delete(vanished.id);
+  await deleteEvent(vanished.id);
+  assert.deepEqual(kept(vanished.id), []);
 });
 
 test('a submit event that arrives after the delete event records nothing', async () => {
@@ -339,18 +418,85 @@ test('the daily check concludes nothing about posts older than Reddit lists', as
   assert.equal(state.sorted.get('recorded')!.size, 1001);
 });
 
+test('the daily check keeps a post that a moderator removed, until its author deletes it', async () => {
+  const hour = 60 * 60 * 1000;
+  const original = post({ title: 'A title removed by a person', url: 'https://i.redd.it/original.png', createdAt: Date.now() - 2 * hour });
+  await submit(original.event);
+  const older = post({ title: 'A title on an older post still up', url: 'https://i.redd.it/older.png', createdAt: Date.now() - 3 * hour });
+  await submit(older.event);
+  state.settings = { checkRemovedPosts: true };
+  state.posts.get(original.id)!.removed = true;
+  await modAction('removelink', original.id, { name: 'modmary', accountType: 1 });
+
+  // Reddit lists it as removed, and a moderator removed it: it stays.
+  assert.equal((await call('/internal/scheduler/daily-check', { name: 'daily-check' })).status, 200);
+  assert.equal(kept(original.id).length, 3);
+  assert.equal(state.redis.has(`removed:${original.id}`), true);
+
+  // Its author deletes it. Reddit sends no event for that; the post is just no longer in the list.
+  state.posts.delete(original.id);
+  assert.equal((await call('/internal/scheduler/daily-check', { name: 'daily-check' })).status, 200);
+  assert.deepEqual(kept(original.id), []);
+  assert.equal(state.redis.has(`removed:${original.id}`), false);
+  assert.equal(kept(older.id).length, 3);
+});
+
+test('the erase menu item asks first, and erases everything only when the box is ticked', async () => {
+  // One of each thing the app stores: a recorded post, a repost it removed and commented on, a post that a moderator removed.
+  await submit(post({ title: 'Screenshot of the day from the app', url: 'https://i.redd.it/one.png' }).event);
+  await submit(post({ title: 'Screenshot of the day from the app', url: 'https://i.redd.it/two.png', author: 'bob' }).event);
+  const byMod = post({ title: 'A title removed by a person', url: 'https://i.redd.it/original.png' });
+  await submit(byMod.event);
+  state.settings = { checkRemovedPosts: true };
+  state.posts.get(byMod.id)!.removed = true;
+  await modAction('removelink', byMod.id, { name: 'modmary', accountType: 1 });
+
+  const asked = await call('/internal/menu/erase', {});
+  assert.equal(asked.status, 200);
+  const shown = asked.body.showForm as { name: string; form: { fields: Array<{ type: string; name: string }>; acceptLabel: string } };
+  assert.equal(shown.name, 'eraseForm');
+  assert.deepEqual(shown.form.fields.map((field) => [field.type, field.name]), [['boolean', 'confirm']]);
+
+  // Asking erased nothing, and neither does an answer without the tick.
+  const stored = state.redis.size;
+  assert.ok(stored > 8);
+  for (const answer of [{}, { confirm: false }, { confirm: 'true' }]) {
+    const refused = await call('/internal/form/erase', answer);
+    assert.deepEqual(refused.body, { showToast: 'Nothing was erased: the box was not ticked.' });
+  }
+  assert.equal(state.redis.size, stored);
+
+  // Every key, and the list of recorded posts.
+  const erased = await call('/internal/form/erase', { confirm: true });
+  assert.deepEqual(erased.body, {
+    showToast: { text: `Repost Cooldown erased everything it had stored (${stored + 1} entries).`, appearance: 'success' },
+  });
+  assert.equal(state.redis.size, 0);
+  assert.equal(state.sorted.size, 0);
+
+  // The app is still on: a post that comes in afterwards is recorded.
+  const next = post({ title: 'Screenshot of the day from the app', url: 'https://i.redd.it/three.png' });
+  await submit(next.event);
+  assert.equal(kept(next.id).length, 3);
+  assert.equal(state.removed.length, 1);
+});
+
 test('every endpoint named in devvit.json is served', async () => {
   const config = JSON.parse(await readFile(new URL('../devvit.json', import.meta.url), 'utf8')) as {
     triggers: Record<string, string>;
     scheduler: { tasks: Record<string, { endpoint: string; cron: string }> };
     menu: { items: Array<{ endpoint: string }> };
+    forms: Record<string, string>;
   };
+  // The form the erase menu item shows must be one that devvit.json names.
+  assert.deepEqual(config.forms, { eraseForm: '/internal/form/erase' });
   const endpoints = [
     ...Object.values(config.triggers),
     ...Object.values(config.scheduler.tasks).map((task) => task.endpoint),
     ...config.menu.items.map((item) => item.endpoint),
+    ...Object.values(config.forms),
   ];
-  assert.equal(endpoints.length, 8);
+  assert.equal(endpoints.length, 10);
   for (const endpoint of endpoints) {
     assert.equal((await call(endpoint, {})).status, 200, endpoint);
   }
