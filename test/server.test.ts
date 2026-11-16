@@ -353,6 +353,26 @@ test('installing records recent posts and stops reading at the cooldown', async 
   assert.deepEqual(state.removed, [repeat.id]);
 });
 
+test('when Reddit fails while the newest posts are read, the reading is done again from the start', async () => {
+  const hour = 60 * 60 * 1000;
+  const newer = post({ title: 'A title on the newer of two posts', url: 'https://i.redd.it/newer.png', createdAt: Date.now() - hour });
+  const older = post({ title: 'A title on the older of two posts', url: 'https://i.redd.it/older.png', createdAt: Date.now() - 2 * hour });
+  // An earlier pass recorded both.
+  assert.equal((await call('/internal/triggers/app-install', { type: 'AppInstall' })).status, 200);
+  assert.equal(kept(newer.id).length + kept(older.id).length, 6);
+
+  // Reddit gives the first post and then fails. Half a list must not be acted
+  // on: the post it did not get to would look deleted, and be erased.
+  state.listingFailures.push(1);
+  const pagesBefore = state.listingPages;
+  assert.equal((await call('/internal/scheduler/daily-check', { name: 'daily-check' })).status, 200);
+  assert.equal(kept(newer.id).length, 3);
+  assert.equal(kept(older.id).length, 3);
+  // The list was read twice: the try that failed, and the one after it.
+  assert.equal(state.listingPages - pagesBefore, 2);
+  assert.deepEqual(state.listingFailures, []);
+});
+
 test('updating the app erases posts that were removed without the app being told', async () => {
   const original = post({ title: 'A title on a post removed quietly', url: 'https://i.redd.it/quiet.png' });
   await submit(original.event);

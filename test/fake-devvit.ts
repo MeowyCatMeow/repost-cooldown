@@ -39,6 +39,12 @@ export const state = {
   notes: [] as string[],
   /** How many pages of the "new" listing were read. */
   listingPages: 0,
+  /**
+   * Makes readings of the "new" listing fail, as when Reddit answers with an
+   * error. Each number is used up by one reading, which fails after giving
+   * that many posts: 0 fails at once.
+   */
+  listingFailures: [] as number[],
 };
 
 /** Puts the fake Reddit and the fake storage back to empty. */
@@ -55,6 +61,7 @@ export function reset(): void {
   state.deletedComments.length = 0;
   state.notes.length = 0;
   state.listingPages = 0;
+  state.listingFailures.length = 0;
 }
 
 export function addPost(fields: Partial<FakePost> & { id: string }): FakePost {
@@ -196,10 +203,14 @@ export const reddit = {
     const pageSize = options.pageSize ?? 100;
     return {
       async *[Symbol.asyncIterator](): AsyncGenerator<FakePost> {
+        const failAfter = state.listingFailures.shift();
         for (const [index, post] of newestFirst.entries()) {
+          if (index === failAfter) throw new Error('13 INTERNAL: 500 Internal Server Error');
           if (index % pageSize === 0) state.listingPages++;
           yield post;
         }
+        // A failure that was due after the last post.
+        if (failAfter !== undefined && failAfter >= newestFirst.length) throw new Error('13 INTERNAL: 500 Internal Server Error');
       },
     };
   },

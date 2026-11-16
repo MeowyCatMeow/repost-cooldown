@@ -35,6 +35,7 @@ import {
   type Settings,
 } from '../core/cooldown.ts';
 import { toPostId } from '../core/normalize.ts';
+import { withRetries } from '../core/retry.ts';
 
 type PostId = `t3_${string}`;
 /** A post as Reddit's API returns it. */
@@ -45,6 +46,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const LISTING_LAG_MS = 10 * 60 * 1000;
 /** The form that asks a moderator to confirm the erasing; devvit.json names it too. */
 const ERASE_FORM = 'eraseForm';
+/** How long to wait before reading the newest posts again after Reddit failed: two more tries. */
+const LISTING_RETRY_PAUSES_MS = [1500, 4000];
 
 /**
  * How Reddit's events say who took a post down, and what kind of account a
@@ -267,26 +270,33 @@ async function settingsOrDefaults(): Promise<Settings> {
   });
 }
 
+/** What one reading of Reddit's list of the subreddit's newest posts shows. */
+type NewestPosts = {
+  /** When the reading began. */
+  startedAt: number;
+  /** The posts that are up. */
+  posts: IncomingPost[];
+  /** The ids of the posts in the list that may stay recorded. */
+  staying: Set<string>;
+  removed: string[];
+  deleted: string[];
+  /** How far back the list was read. Nothing is concluded about older posts. */
+  readBackTo: number;
+};
+
 /**
- * Reads the subreddit's newest posts (Reddit lists at most 1000) and brings
- * what the app has recorded in line with it. Posts that are up are recorded.
- * Removed posts are erased. And a post that is recorded but missing from the
- * list is erased: that is how a post shows that was deleted without the app
- * being told.
- *
- * Posts that a moderator removed are the exception, where the subreddit has
- * that option on: they are left as they are, listed or not.
+ * Reads Reddit's list of the subreddit's newest posts, which holds at most
+ * 1000. Throws when Reddit fails part of the way: half a list would make the
+ * posts in the other half look deleted.
  */
-async function rescan(current: Settings): Promise<{ recorded: number; erased: number }> {
+async function readNewestPosts(current: Settings): Promise<NewestPosts> {
   const subredditName = context.subredditName;
   const startedAt = Date.now();
   const oldest = startedAt - current.cooldownDays * DAY_MS;
   const posts: IncomingPost[] = [];
-  /** The posts in the list that may stay recorded. */
   const staying = new Set<string>();
   const removed: string[] = [];
   const deleted: string[] = [];
-  // How far back the list was read. Nothing is concluded about older posts.
   let readBackTo = Infinity;
   // The listing is newest first, so reading stops at the first post that is past the cooldown.
   for await (const post of reddit.getNewPosts({ subredditName, limit: 1000, pageSize: 100 })) {
@@ -306,6 +316,29 @@ async function rescan(current: Settings): Promise<{ recorded: number; erased: nu
       deleted.push(post.id);
     }
   }
+  return { startedAt, posts, staying, removed, deleted, readBackTo };
+}
+
+/**
+ * Reads the subreddit's newest posts (Reddit lists at most 1000) and brings
+ * what the app has recorded in line with it. Posts that are up are recorded.
+ * Removed posts are erased. And a post that is recorded but missing from the
+ * list is erased: that is how a post shows that was deleted without the app
+ * being told.
+ *
+ * Posts that a moderator removed are the exception, where the subreddit has
+ * that option on: they are left as they are, listed or not.
+ */
+async function rescan(current: Settings): Promise<{ recorded: number; erased: number }> {
+  // Reddit's API fails for a moment now and then. Without another try, an
+  // install that hit such a moment would start with nothing recorded, and
+  // would catch no repost of an older post until the next daily check.
+  const { startedAt, posts, staying, removed, deleted, readBackTo } = await withRetries(
+    () => readNewestPosts(current),
+    LISTING_RETRY_PAUSES_MS,
+    (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    (error, triesLeft) => log(`could not read the newest posts, ${triesLeft} more tries: ${String(error)}`)
+  );
   let erased = await forgetPosts(deleted, deps());
   const sorted = await forgetRemoved(removed, current, deps());
   erased += sorted.erased;
