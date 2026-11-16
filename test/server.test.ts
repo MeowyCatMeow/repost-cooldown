@@ -292,12 +292,12 @@ test('a delete event that reports a removal, or does not say who did it, is not 
   await deleteEvent(deleted.id, 0);
   assert.deepEqual(kept(deleted.id), []);
 
-  // A post that Reddit can no longer show at all is treated as deleted.
-  const vanished = post({ title: 'A title on a post that vanished', url: 'https://i.redd.it/vanished.png' });
-  await submit(vanished.event);
-  state.posts.delete(vanished.id);
-  await deleteEvent(vanished.id);
-  assert.deepEqual(kept(vanished.id), []);
+  // A post that cannot be read just now is not taken for deleted: a failed call says nothing about it.
+  const unreadable = post({ title: 'A title on a post that cannot be read', url: 'https://i.redd.it/unreadable.png' });
+  await submit(unreadable.event);
+  state.posts.delete(unreadable.id);
+  assert.equal((await deleteEvent(unreadable.id)).status, 200);
+  assert.equal(kept(unreadable.id).length, 3);
 });
 
 test('a submit event that arrives after the delete event records nothing', async () => {
@@ -457,6 +457,26 @@ test('a post that a moderator removed keeps counting after its author deletes it
   assert.deepEqual(kept(original.id), []);
   assert.equal(state.redis.has(`removed:${original.id}`), false);
   assert.equal(kept(older.id).length, 3);
+});
+
+test('an update while the settings cannot be read does not erase the posts that a moderator removed', async () => {
+  const hour = 60 * 60 * 1000;
+  const original = post({ title: 'A title removed by a person', url: 'https://i.redd.it/original.png', createdAt: Date.now() - 2 * hour });
+  await submit(original.event);
+  const filtered = post({ title: 'A title removed by a filter', url: 'https://i.redd.it/filtered.png', createdAt: Date.now() - 2 * hour });
+  await submit(filtered.event);
+  state.settings = { checkRemovedPosts: true };
+  state.posts.get(original.id)!.removed = true;
+  await modAction('removelink', original.id, { name: 'modmary', accountType: 1 });
+  state.posts.get(filtered.id)!.removedByCategory = 'reddit';
+
+  // The app cannot tell whether the option is on, so it erases nothing that depends on it.
+  state.settingsFail = true;
+  assert.equal((await call('/internal/triggers/app-upgrade', { type: 'AppUpgrade' })).status, 200);
+  assert.equal(kept(original.id).length, 3);
+  assert.equal(state.redis.has(`removed:${original.id}`), true);
+  // A post removed by a filter is erased either way.
+  assert.deepEqual(kept(filtered.id), []);
 });
 
 test('the erase menu item asks first, and erases everything only when the box is ticked', async () => {

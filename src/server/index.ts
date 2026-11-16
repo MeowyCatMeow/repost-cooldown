@@ -206,11 +206,12 @@ async function onPostDelete(event: OnPostDeleteRequest): Promise<void> {
   if (!id || holds(event.source, BY_MODERATOR)) return;
   if (!holds(event.source, BY_AUTHOR) && !holds(event.source, BY_REDDIT)) {
     // Reddit did not say who did it, so the app looks at what became of the
-    // post. A removal is left to the moderator action and the daily check.
-    // A post that can no longer be read at all is treated as deleted.
+    // post. A removal is left to the moderator action and the daily check. So
+    // is a post that cannot be read just now: a deleted post can still be
+    // read, so a failure says nothing about it.
     const state = await gateway.getPostInfo(id).then(
       (info) => info.state,
-      () => 'deleted' as const
+      () => undefined
     );
     if (state !== 'deleted') return;
   }
@@ -253,11 +254,16 @@ async function onModAction(event: OnModActionRequest): Promise<void> {
   if (await forgetPost(id, deps())) log(`${id}: removed, erased`);
 }
 
-/** Recording removes nothing, so the defaults are a safe stand-in when the settings cannot be read. */
+/**
+ * The settings for a rescan, with a stand-in for when they cannot be read. A
+ * rescan removes no post, so the defaults will do, with one exception: it also
+ * erases, and a post that a moderator removed is only kept where that option
+ * is on. The stand-in says it is on, so that nothing is erased on a guess.
+ */
 async function settingsOrDefaults(): Promise<Settings> {
   return loadSettings().catch((error: unknown) => {
     log(`could not read the settings, recording with the defaults: ${String(error)}`);
-    return parseSettings(undefined);
+    return { ...parseSettings(undefined), checkRemovedPosts: true };
   });
 }
 

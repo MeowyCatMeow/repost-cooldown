@@ -1011,6 +1011,34 @@ test('a post deleted at the moment a moderator removes it is not remembered', as
   assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
 });
 
+test('a removal event for a post that is up again does not mark it', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' });
+  // A moderator removed it and approved it again at once; the removal event is handled last.
+  assert.equal(await handlePostRemovedByModerator(first.post.id, REMEMBER, w.deps), false);
+  assert.equal(w.data.has(`removed:${first.post.id}`), false);
+  const again = await w.submit({ title: 'The very same title twice', url: 'https://example.com/x' }, REMEMBER);
+  assert.deepEqual(again.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+  assert.match(w.comments[0]!.text, /can be shared again once 30 days/);
+
+  // When Reddit cannot be asked, the event is taken at its word for a post the app has recorded.
+  const second = await w.submit({ title: 'Another title that is used twice' });
+  w.posts.get(second.post.id)!.state = 'removed';
+  w.unreadable.add(second.post.id);
+  assert.equal(await handlePostRemovedByModerator(second.post.id, REMEMBER, w.deps), true);
+  assert.equal(w.data.has(`removed:${second.post.id}`), true);
+});
+
+test('the daily check writes nothing for a removed post it holds nothing about', async () => {
+  const w = new World();
+  const up = await w.submit({ title: 'A post that is still up today', url: 'https://example.com/up' });
+  const before = JSON.stringify([[...w.data], [...w.sorted].map(([key, set]) => [key, [...set]])]);
+  // Most removed posts in Reddit's list are ones the app never recorded, or has already erased.
+  assert.deepEqual(await forgetRemoved(['t3_never1', 't3_never2'], REMEMBER, w.deps), { kept: [], erased: 0 });
+  assert.equal(JSON.stringify([[...w.data], [...w.sorted].map(([key, set]) => [key, [...set]])]), before);
+  assert.equal(recordOf(w, up.post.id).length, 3);
+});
+
 test('an edit of a post that a moderator removed is read from Reddit, not from the event', async () => {
   const w = new World();
   const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });

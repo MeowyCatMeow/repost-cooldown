@@ -50,7 +50,7 @@ The option covers removals made while it is ticked. Untick it, and the app forge
 
 ### Approving a post the app removed
 
-When a moderator approves a post that the app removed, the post stays up and the app deletes its own comment from it.
+When a moderator approves a post that the app removed, the post stays up and the app deletes its own comment from it. The app remembers which comment that is for 30 days at most.
 
 ## Edited posts
 

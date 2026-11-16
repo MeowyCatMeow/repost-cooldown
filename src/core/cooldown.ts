@@ -424,6 +424,12 @@ async function unlistKeys(names: string[], store: Store): Promise<void> {
   if (names.length > 0) await store.zRem(KEYS, names);
 }
 
+/** Erases keys and takes them off the list, so that the two never drift apart. */
+async function drop(store: Store, ...names: string[]): Promise<void> {
+  await store.del(...names);
+  await unlistKeys(names, store);
+}
+
 /** Erases the fingerprints in `keys` that belong to the post, or to no post that can be read. */
 async function release(id: string, keys: Iterable<string>, store: Store): Promise<void> {
   const erased: string[] = [];
@@ -494,8 +500,7 @@ async function indexPost(
     // The deletion may have erased the record before the fingerprints were
     // written, so they are erased by name rather than through the record.
     await release(post.id, current, store);
-    await store.del(recordKey);
-    await unlistKeys([recordKey], store);
+    await drop(store, recordKey);
     await store.zRem(RECORDED, [post.id]);
     return false;
   }
@@ -598,10 +603,7 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
       if (!info) continue;
       if (info.state === 'up') {
         // A mark that a moderator once removed it is out of date here.
-        if (marked) {
-          await store.del(removedKey);
-          await unlistKeys([removedKey], store);
-        }
+        if (marked) await drop(store, removedKey);
         match = candidate;
         break;
       }
@@ -659,8 +661,7 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
     return { action: 'removed', ...found };
   } catch (error) {
     // Let a redelivered event try again.
-    await store.del(seenKey);
-    await unlistKeys([seenKey], store);
+    await drop(store, seenKey);
     throw error;
   }
 }
@@ -684,8 +685,7 @@ export async function forgetPost(rawId: string, deps: Pick<Deps, 'store' | 'now'
   const removedKey = `removed:${id}`;
   const record = readRecord(await store.get(recordKey));
   if (record) await release(id, record.keys, store);
-  await store.del(recordKey, removedKey);
-  await unlistKeys([recordKey, removedKey], store);
+  await drop(store, recordKey, removedKey);
   await store.zRem(RECORDED, [id]);
   return record !== undefined;
 }
@@ -717,10 +717,10 @@ export async function forgetRemoved(
   for (let i = 0; i < ids.length; i += BATCH) {
     await Promise.all(
       ids.slice(i, i + BATCH).map(async (id) => {
-        const remembered =
-          settings.checkRemovedPosts && (await store.get(`removed:${id}`)) && (await store.get(`post:${id}`));
-        if (remembered) kept.push(id);
-        else if (await forgetPost(id, deps)) erased++;
+        const [mark, record] = await Promise.all([store.get(`removed:${id}`), store.get(`post:${id}`)]);
+        if (settings.checkRemovedPosts && mark && record) kept.push(id);
+        // Nothing stored for it means nothing to erase: most removed posts in the list are like that.
+        else if ((mark || record) && (await forgetPost(id, deps))) erased++;
       })
     );
   }
@@ -752,21 +752,22 @@ export async function handlePostRemovedByModerator(rawId: string, settings: Sett
   const cooldownMs = settings.cooldownDays * DAY_MS;
   const goneKey = `gone:${id}`;
 
+  // The event says the post was removed, but events arrive late and out of
+  // order: a moderator may have approved it again since, or its author may
+  // have deleted it. So the post is read from Reddit, which a moderator can
+  // still do for a removed post.
   let madeAt = readRecord(await store.get(`post:${id}`))?.at;
+  const found = await reddit.getPost(id).catch((error: unknown) => {
+    deps.log?.(`${id} was removed by a moderator but could not be read: ${String(error)}`);
+    return undefined;
+  });
+  if (found?.state === 'deleted') await forgetPost(id, deps);
+  if (found && found.state !== 'removed') return false;
   if (madeAt === undefined) {
     // Not recorded: a filter held it back when it came in, or the app never
-    // saw it. A moderator can still read it, so it is read from Reddit.
-    let found: Awaited<ReturnType<RedditGateway['getPost']>>;
-    try {
-      found = await reddit.getPost(id);
-    } catch (error) {
-      deps.log?.(`${id} was removed by a moderator but could not be read, so it is not remembered: ${String(error)}`);
-      return false;
-    }
-    if (found.state === 'deleted') await forgetPost(id, deps);
-    if (found.state !== 'removed' || found.post.createdAt + cooldownMs <= now) return false;
-    await store.del(goneKey);
-    await unlistKeys([goneKey], store);
+    // saw it. Without being able to read it there is nothing to record.
+    if (!found || found.post.createdAt + cooldownMs <= now) return false;
+    await drop(store, goneKey);
     if (!(await indexPost(found.post, fingerprintsOf(found.post, settings), cooldownMs, deps))) return false;
     madeAt = found.post.createdAt;
   }
@@ -778,8 +779,7 @@ export async function handlePostRemovedByModerator(rawId: string, settings: Sett
   await store.set(removedKey, '1', { expiration: new Date(expiresAt) });
   // Its author may have deleted it at this very moment. Then nothing stays.
   if (await store.get(goneKey)) {
-    await store.del(removedKey);
-    await unlistKeys([removedKey], store);
+    await drop(store, removedKey);
     return false;
   }
   return true;
@@ -918,8 +918,7 @@ export async function handlePostApproved(
 
   const removedKey = `removed:${id}`;
   if (await store.get(removedKey)) {
-    await store.del(removedKey);
-    await unlistKeys([removedKey], store);
+    await drop(store, removedKey);
     result.unmarked = true;
   }
 
@@ -932,8 +931,7 @@ export async function handlePostApproved(
     } catch (error) {
       deps.log?.(`${id} was approved but the removal comment could not be deleted: ${String(error)}`);
     }
-    await store.del(commentKey);
-    await unlistKeys([commentKey], store);
+    await drop(store, commentKey);
   }
 
   // A moderator has decided the post stays, so a submit event for it that
@@ -950,9 +948,7 @@ export async function handlePostApproved(
   const settings = await loadSettings();
   const cooldownMs = settings.cooldownDays * DAY_MS;
   if (found.post.createdAt + cooldownMs <= deps.now()) return result;
-  const goneKey = `gone:${id}`;
-  await store.del(goneKey);
-  await unlistKeys([goneKey], store);
+  await drop(store, `gone:${id}`);
   result.recorded = await indexPost(found.post, fingerprintsOf(found.post, settings), cooldownMs, deps);
   return result;
 }
