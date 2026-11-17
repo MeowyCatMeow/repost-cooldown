@@ -134,6 +134,48 @@ test('an edited post is read again', async () => {
   assert.deepEqual(state.removed, []);
 });
 
+test('a post that is edited into a copy of another post is removed', async () => {
+  const text = 'This is the whole text of the first post, and it is long enough to be compared.';
+  const filler = 'Nothing to see here yet, so please come back a little later today.';
+  const first = post({ title: 'Where the text was posted first', text });
+  await submit(first.event);
+  const second = post({ title: 'Something else entirely for now', text: filler, author: 'bob' });
+  await submit(second.event);
+  assert.deepEqual(state.removed, []);
+
+  /** The author swaps a post's text for another, and Reddit tells the app. */
+  const edit = (target: ReturnType<typeof post>, from: string, to: string, fields: object = {}) => {
+    state.posts.get(target.id)!.body = to;
+    const event = { ...target.event, post: { ...target.event.post, selftext: to }, previousBody: from, ...fields };
+    return call('/internal/triggers/post-update', { type: 'PostUpdate', ...event });
+  };
+  assert.equal((await edit(second, filler, text)).status, 200);
+  assert.deepEqual(state.removed, [second.id]);
+  assert.equal(state.comments.length, 1);
+  assert.equal(state.comments[0]!.pinned, true);
+  assert.match(state.comments[0]!.text, /u\/bob/);
+  assert.match(state.notes[0]!, /edited, same text as/);
+  assert.equal(state.redis.has(`post:${second.id}`), false);
+  // Reddit sends the event again: nothing more happens.
+  assert.equal((await edit(second, filler, text)).status, 200);
+  assert.deepEqual(state.removed, [second.id]);
+  assert.equal(state.comments.length, 1);
+
+  // An event that names no author is judged by the author Reddit shows for the post.
+  const third = post({ title: 'A third post under its own title', text: `${filler} Again.`, author: 'carol' });
+  await submit(third.event);
+  assert.equal((await edit(third, `${filler} Again.`, text, { author: undefined })).status, 200);
+  assert.deepEqual(state.removed, [second.id, third.id]);
+  assert.match(state.comments[1]!.text, /u\/carol/);
+
+  // A moderator's post is left up.
+  state.moderators.add('modmary');
+  const fourth = post({ title: 'A word from the moderators', text: `${filler} Once more.`, author: 'modmary' });
+  await submit(fourth.event);
+  assert.equal((await edit(fourth, `${filler} Once more.`, text)).status, 200);
+  assert.deepEqual(state.removed, [second.id, third.id]);
+});
+
 /** A moderator action as Reddit reports it. Account type 1 is a person, 3 is an app; Reddit may send the name instead. */
 const modAction = (action: string, id: string, moderator: { name: string; accountType: number | string }) =>
   call('/internal/triggers/mod-action', {

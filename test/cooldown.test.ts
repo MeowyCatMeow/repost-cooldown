@@ -201,6 +201,13 @@ class World {
     const outcome = await handleNewPost(post, settings, this.deps);
     return { post, outcome };
   }
+
+  /** The author changes a post's text, and Reddit tells the app. */
+  async edit(post: IncomingPost, body: string, settings: Settings = DEFAULT_SETTINGS) {
+    const edited = { ...post, body };
+    this.contents.set(post.id, edited);
+    return handlePostEdited(edited, async () => settings, this.deps);
+  }
 }
 
 test('a crosspost of a recent post from the same subreddit is removed', async () => {
@@ -619,7 +626,7 @@ test('a post deleted while an edit or a rescan is recording it is not kept', asy
   const first = await edited.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
   edited.deleteDuring(first.post.id, 'fp:link:');
   const change = { ...first.post, body: 'Details here: https://example.com/new-page' };
-  assert.equal(await handlePostEdited(change, settings, edited.deps), false);
+  assert.deepEqual(await handlePostEdited(change, settings, edited.deps), { action: 'gone' });
   assert.deepEqual(edited.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
 
   const scanned = new World();
@@ -748,7 +755,7 @@ test('an edit frees what the post no longer contains and records what it contain
   const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
   // The author swaps the link for another one.
   const edited = { ...first.post, body: 'Details here: https://example.com/new-page' };
-  assert.equal(await handlePostEdited(edited, settings, w.deps), true);
+  assert.deepEqual(await handlePostEdited(edited, settings, w.deps), { action: 'recorded' });
 
   w.advance(1);
   const video = await w.submit({ title: 'Just the video on its own', url: VIDEO });
@@ -759,21 +766,229 @@ test('an edit frees what the post no longer contains and records what it contain
   assert.match(w.comments[0]!.text, /1 day ago/);
 });
 
-test('an edit never removes a post or takes over what another post owns', async () => {
+/** A text long enough to be compared, and a filler that a post can start out with. */
+const COPIED = 'This is the whole text of the first post, and it is long enough to be compared.';
+const FILLER = 'Nothing to see here yet, so please come back a little later today.';
+
+test('a post that is edited into a copy of another post is removed', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  w.advance(2);
+  const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true, authorName: 'bob' });
+  assert.equal(second.outcome.action, 'indexed');
+
+  // A day later its author swaps the filler for the first post's text.
+  w.advance(1);
+  assert.deepEqual(await w.edit(second.post, COPIED), { action: 'removed', reason: 'text', originalId: first.post.id });
+  assert.deepEqual(w.removed, [second.post.id]);
+  assert.equal(w.comments.length, 1);
+  assert.match(w.comments[0]!.text, /u\/bob/);
+  assert.match(w.comments[0]!.text, /same text/);
+  // The original's age is counted up to the edit, not up to when the copy was posted.
+  assert.match(w.comments[0]!.text, /3 days ago/);
+  assert.match(w.notes[0]!, /^Repost Cooldown: edited, same text as t3_p1, made 3 days ago$/);
+  // Nothing is kept of the removed post but the comment to take off if a moderator approves it.
+  assert.deepEqual(w.about(second.post.id), [`comment:${second.post.id}`, `gone:${second.post.id}`, `seen:${second.post.id}`]);
+  assert.deepEqual(w.listed(), [first.post.id]);
+
+  // The first post is still the original.
+  const third = await w.submit({ title: 'A third post with the same text', body: COPIED, isSelf: true });
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'text', originalId: first.post.id });
+
+  // An edit to a post the app is not tracking, such as one it removed, changes nothing.
+  assert.deepEqual(await w.edit(third.post, 'Edited after it was removed, with enough words to compare.'), { action: 'ignored' });
+  assert.deepEqual(w.removed, [second.post.id, third.post.id]);
+});
+
+test('the post that was edited is the repost, even when it is the older of the two', async () => {
+  const w = new World();
+  const older = await w.submit({ title: 'The older post of the two here', body: FILLER, isSelf: true });
+  w.advance(1);
+  const newer = await w.submit({ title: 'The newer post of the two here', body: COPIED, isSelf: true });
+  w.advance(1);
+  assert.deepEqual(await w.edit(older.post, COPIED), { action: 'removed', reason: 'text', originalId: newer.post.id });
+  assert.deepEqual(w.removed, [older.post.id]);
+  assert.match(w.comments[0]!.text, /1 day ago/);
+});
+
+test('a link that is edited into a post counts like one it was posted with', async () => {
   const w = new World();
   const first = await w.submit({ title: 'Watch this one before the weekend', url: VIDEO });
   w.advance(1);
   const second = await w.submit({ title: 'Something else entirely for now', body: 'Nothing to see yet.', isSelf: true });
-  // The second post is edited to contain the first post's link.
-  assert.equal(await handlePostEdited({ ...second.post, body: `Now with ${VIDEO}` }, settings, w.deps), true);
+  assert.deepEqual(await w.edit(second.post, `Now with ${VIDEO}`), { action: 'removed', reason: 'link', originalId: first.post.id });
+
+  // With the title and its text both the same, the title is what the two share.
+  const third = await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const fourth = await w.submit({ title: 'Where the text was posted first', body: FILLER, isSelf: true });
+  assert.equal(fourth.outcome.action, 'indexed');
+  const rules = { ...DEFAULT_SETTINGS, checkText: false };
+  assert.deepEqual(await w.edit(fourth.post, COPIED, rules), { action: 'removed', reason: 'title', originalId: third.post.id });
+  // A rule that is switched off is not applied to edits either.
+  const fifth = await w.submit({ title: 'A fifth post under its own title', body: FILLER, isSelf: true });
+  assert.deepEqual(await w.edit(fifth.post, COPIED, rules), { action: 'recorded' });
+});
+
+test('an edit is judged by what the post says on Reddit now, not by what the event shows', async () => {
+  const w = new World();
+  await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
+
+  // Two edits in a row, the copy and then words of its own, and the event for the first one arrives last.
+  const own = 'These are words of its own that no other post in the subreddit has.';
+  w.contents.set(second.post.id, { ...second.post, body: own });
+  assert.deepEqual(await handlePostEdited({ ...second.post, body: COPIED }, settings, w.deps), { action: 'recorded' });
   assert.deepEqual(w.removed, []);
+  // It is recorded with what it says now.
+  const third = await w.submit({ title: 'A third post, with those words', body: own, isSelf: true });
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'text', originalId: second.post.id });
 
-  w.advance(1);
-  const third = await w.submit({ title: 'Third time for the same video', url: VIDEO });
-  assert.deepEqual(third.outcome, { action: 'removed', reason: 'link', originalId: first.post.id });
+  // A post that cannot be read is not removed on a guess.
+  const fourth = await w.submit({ title: 'A fourth post under its own title', body: FILLER, isSelf: true });
+  w.unreadable.add(fourth.post.id);
+  assert.deepEqual(await w.edit(fourth.post, COPIED), { action: 'recorded' });
+  assert.deepEqual(w.removed, [third.post.id]);
+  w.unreadable.delete(fourth.post.id);
 
-  // An edit to a post the app is not tracking, such as one it removed, changes nothing.
-  assert.equal(await handlePostEdited({ ...third.post, body: 'Edited after removal' }, settings, w.deps), false);
+  // One that is already down is not removed a second time.
+  const fifth = await w.submit({ title: 'A fifth post under its own title', body: `${FILLER} Again.`, isSelf: true });
+  w.posts.get(fifth.post.id)!.state = 'removed';
+  assert.deepEqual(await w.edit(fifth.post, COPIED), { action: 'recorded' });
+  assert.deepEqual(w.removed, [third.post.id]);
+  assert.equal(w.comments.length, 1);
+
+  // One that was deleted in the meantime is erased.
+  const sixth = await w.submit({ title: 'A sixth post under its own title', body: `${FILLER} Once more.`, isSelf: true });
+  w.posts.get(sixth.post.id)!.state = 'deleted';
+  assert.deepEqual(await w.edit(sixth.post, COPIED), { action: 'gone' });
+  assert.deepEqual(recordOf(w, sixth.post.id), []);
+});
+
+test('an edit does not get a post removed for what it already said', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Watch this one before the weekend', url: VIDEO });
+  const second = await w.submit({ title: 'My thoughts on that talk', body: `It is good: ${VIDEO}`, isSelf: true });
+  assert.equal(second.outcome.action, 'removed');
+  // A moderator approves the repost. Its author then adds to it, and the link is still there.
+  w.posts.get(second.post.id)!.state = 'up';
+  await handlePostApproved(second.post.id, settings, w.deps);
+  assert.deepEqual(await w.edit(second.post, `It is very good: ${VIDEO}`), { action: 'recorded' });
+  assert.deepEqual(w.removed, [second.post.id]);
+  assert.equal(w.comments.length, 1);
+
+  // A moderator's own post stays up whatever is edited into it.
+  w.moderators.add('modmary');
+  const byMod = await w.submit({ title: 'A word from the moderators', body: FILLER, isSelf: true, authorName: 'modmary' });
+  assert.deepEqual(await w.edit(byMod.post, `Pinned for the week: ${VIDEO}`), { action: 'exempt', reason: 'link', originalId: first.post.id });
+  assert.deepEqual(w.removed, [second.post.id]);
+  // Unless the subreddit does not make that exception.
+  const strict = { ...DEFAULT_SETTINGS, exemptModerators: false };
+  const another = await w.submit({ title: 'Another word from the moderators', body: FILLER, isSelf: true, authorName: 'modmary' }, strict);
+  assert.equal(another.outcome.action, 'indexed');
+  assert.deepEqual(await w.edit(another.post, `Also worth an hour: ${VIDEO}`, strict), { action: 'removed', reason: 'link', originalId: first.post.id });
+});
+
+test('an edit that copies a post that is no longer up is allowed', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
+  // The first post was deleted, and the event that says so never came.
+  w.posts.get(first.post.id)!.state = 'deleted';
+  assert.deepEqual(await w.edit(second.post, COPIED), { action: 'recorded' });
+  assert.deepEqual(w.removed, []);
+  assert.deepEqual(recordOf(w, first.post.id), []);
+
+  // The edited post is the original from now on.
+  const third = await w.submit({ title: 'A third post with the same text', body: COPIED, isSelf: true });
+  assert.deepEqual(third.outcome, { action: 'removed', reason: 'text', originalId: second.post.id });
+});
+
+test('an edit that copies a post a moderator removed is removed only with that option on', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true }, REMEMBER);
+  await removeAsModerator(w, first.post.id);
+  const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true }, REMEMBER);
+  assert.deepEqual(await w.edit(second.post, COPIED, REMEMBER), {
+    action: 'removed',
+    reason: 'text',
+    originalId: first.post.id,
+    originalRemoved: true,
+  });
+  assert.match(w.comments[0]!.text, /that the moderators of r\/home removed/);
+  assert.match(w.notes[0]!, /edited, same text as t3_p1 \(removed by a mod\)/);
+  assert.ok(w.notes[0]!.length <= 100);
+
+  // With the option off, a removed post is erased, and its text is free.
+  const off = new World();
+  const removed = await off.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  off.posts.get(removed.post.id)!.state = 'removed';
+  await forgetPost(removed.post.id, off.deps);
+  const other = await off.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
+  assert.deepEqual(await off.edit(other.post, COPIED), { action: 'recorded' });
+  assert.deepEqual(off.removed, []);
+});
+
+test('an edit that Reddit reports twice removes the post once', async () => {
+  // Both deliveries at the same moment.
+  const w = new World();
+  await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
+  const edited = { ...second.post, body: COPIED };
+  w.contents.set(second.post.id, edited);
+  const both = await Promise.all([handlePostEdited(edited, settings, w.deps), handlePostEdited(edited, settings, w.deps)]);
+  assert.deepEqual(both.map((outcome) => outcome.action).sort(), ['duplicate-event', 'removed']);
+  assert.deepEqual(w.removed, [second.post.id]);
+  assert.equal(w.comments.length, 1);
+  assert.equal(w.notes.length, 1);
+  assert.equal(w.data.has(`editing:${second.post.id}`), false);
+  // And once more, later.
+  assert.deepEqual(await handlePostEdited(edited, settings, w.deps), { action: 'ignored' });
+
+  // One delivery finishes while the other is between reading the post and removing it.
+  const late = new World();
+  await late.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const slow = await late.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
+  const change = { ...slow.post, body: COPIED };
+  late.contents.set(slow.post.id, change);
+  const isModerator = late.deps.reddit.isModerator;
+  let inside: Awaited<ReturnType<typeof handlePostEdited>> | undefined;
+  late.deps.reddit.isModerator = async (name) => {
+    if (!inside) {
+      inside = { action: 'ignored' };
+      inside = await handlePostEdited(change, settings, late.deps);
+    }
+    return isModerator(name);
+  };
+  assert.deepEqual(await handlePostEdited(change, settings, late.deps), { action: 'duplicate-event' });
+  assert.equal(inside?.action, 'removed');
+  assert.deepEqual(late.removed, [slow.post.id]);
+  assert.equal(late.comments.length, 1);
+});
+
+test('when an edited post cannot be removed, the edit can be handled again', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
+  const remove = w.deps.reddit.remove;
+  w.deps.reddit.remove = async () => {
+    throw new Error('Reddit did not answer');
+  };
+  await assert.rejects(w.edit(second.post, COPIED), /did not answer/);
+  // The post is still recorded, and nothing holds it back.
+  assert.equal(w.data.has(`post:${second.post.id}`), true);
+  assert.equal(w.data.has(`editing:${second.post.id}`), false);
+  assert.equal(w.comments.length, 0);
+
+  w.deps.reddit.remove = remove;
+  assert.deepEqual(await w.edit(second.post, COPIED), { action: 'removed', reason: 'text', originalId: first.post.id });
+
+  // A moderator who disagrees approves it: the comment goes, and it is an ordinary post again.
+  w.posts.get(second.post.id)!.state = 'up';
+  await handlePostApproved(second.post.id, settings, w.deps);
+  assert.deepEqual(w.deletedComments, ['t1_c1']);
+  assert.equal(w.data.has(`post:${second.post.id}`), true);
+  assert.deepEqual(await w.edit(second.post, `${COPIED} Edit: thanks for the answers.`), { action: 'recorded' });
+  assert.deepEqual(w.removed, [second.post.id]);
 });
 
 const settings = async () => DEFAULT_SETTINGS;
@@ -788,7 +1003,7 @@ test('a post removed by something that does not count is erased, even one its au
   w.posts.get(first.post.id)!.state = 'removed';
   assert.equal(await forgetPost(first.post.id, w.deps), true);
   // Its author edits it afterwards: nothing is recorded for a post that is down.
-  assert.equal(await handlePostEdited({ ...first.post, body: `More details: ${VIDEO}` }, settings, w.deps), false);
+  assert.deepEqual(await handlePostEdited({ ...first.post, body: `More details: ${VIDEO}` }, settings, w.deps), { action: 'ignored' });
   assert.deepEqual(w.about(first.post.id), [`gone:${first.post.id}`, `seen:${first.post.id}`]);
 
   w.advance(1);
@@ -1046,7 +1261,7 @@ test('an edit of a post that a moderator removed is read from Reddit, not from t
   // Its author edits the link out. The event carries blanked-out text, the same before and after.
   w.contents.set(first.post.id, { ...first.post, body: 'Details here: https://example.com/new-page' });
   const event = { ...first.post, body: '[removed]' };
-  assert.equal(await handlePostEdited(event, settings, w.deps, true), true);
+  assert.deepEqual(await handlePostEdited(event, settings, w.deps, true), { action: 'recorded' });
 
   w.advance(1);
   const video = await w.submit({ title: 'Just the video on its own', url: VIDEO });
@@ -1056,20 +1271,20 @@ test('an edit of a post that a moderator removed is read from Reddit, not from t
 
   // If the post turns out to be deleted, the edit event is what gets it erased.
   w.posts.get(first.post.id)!.state = 'deleted';
-  assert.equal(await handlePostEdited(event, settings, w.deps, true), false);
+  assert.deepEqual(await handlePostEdited(event, settings, w.deps, true), { action: 'gone' });
   assert.deepEqual(recordOf(w, first.post.id), []);
 
   // So is one that cannot be read: there is no telling what it says now.
   const second = await w.submit({ title: 'Second write-up about the product', body: `More details here: ${VIDEO}`, isSelf: true });
   await removeAsModerator(w, second.post.id);
   w.unreadable.add(second.post.id);
-  assert.equal(await handlePostEdited({ ...second.post, body: '[removed]' }, settings, w.deps), false);
+  assert.deepEqual(await handlePostEdited({ ...second.post, body: '[removed]' }, settings, w.deps), { action: 'gone' });
   assert.deepEqual(recordOf(w, second.post.id), []);
   assert.equal(w.data.has(`removed:${second.post.id}`), false);
 
   // For an ordinary post, an event that shows the same text before and after changes nothing.
   const before = JSON.stringify([...w.data]);
-  assert.equal(await handlePostEdited({ ...video.post, body: 'ignored' }, settingsNotNeeded, w.deps, true), false);
+  assert.deepEqual(await handlePostEdited({ ...video.post, body: 'ignored' }, settingsNotNeeded, w.deps, true), { action: 'ignored' });
   assert.equal(JSON.stringify([...w.data]), before);
 });
 

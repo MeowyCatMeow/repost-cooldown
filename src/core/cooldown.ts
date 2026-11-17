@@ -12,7 +12,8 @@
  *   gone:<id>        -> "1"            the post was deleted, or removed in a way that does not count; nothing about it may be recorded
  *   removed:<id>     -> "1"            a moderator removed the post; it is still on Reddit and still counts as an original
  *   comment:<id>     -> a comment id   the removal comment the app left on a post it removed
- *   recorded         -> a sorted set   the ids of the posts that have a record, by the time they were made
+ *   editing:<id>     -> a token        the post was edited into a repost and is being removed; gone when that is done
+ *   recorded        -> a sorted set   the ids of the posts that have a record, by the time they were made
  *   keys             -> a sorted set   the name of every key above that the app has written
  *
  * Nothing here names a person, and no title, text or link is kept: a
@@ -31,7 +32,9 @@
  *   - A post that its author deleted, or that Reddit took down, is erased as
  *     soon as the app learns of it (forgetPost). So is one removed by
  *     AutoModerator, a filter or another app.
- *   - An edited post is read again, and what it no longer has is erased.
+ *   - An edited post is read again, and what it no longer has is erased. If
+ *     the edit put into it what another post already has, it is removed like
+ *     a new post that repeats one, and erased.
  *   - Nothing outlives 30 days from the last time the app read the post from
  *     Reddit and found it up, the longest Reddit recommends. So a post that a
  *     moderator removed is forgotten 30 days after that at the latest.
@@ -74,6 +77,8 @@ const MAX_COOLDOWN_DAYS = 365;
 const RETENTION_MS = 30 * DAY_MS;
 /** How long after the fact Reddit may still send an event about a post, repeated or out of order. */
 const LATE_EVENT_MS = 2 * DAY_MS;
+/** The longest one delivery of an event may keep a post to itself while it removes it. */
+const CLAIM_MS = 10 * 60 * 1000;
 /** How many posts are handled at once when many are handled together. */
 const BATCH = 25;
 /** The sorted set that lists the posts with a record: the only way to find them without knowing their ids. */
@@ -265,8 +270,35 @@ export type Outcome =
   | { action: 'exempt'; reason: Reason; originalId: string; originalRemoved?: true }
   | { action: 'removed'; reason: Reason; originalId: string; originalRemoved?: true };
 
+/**
+ * What became of an edit. `ignored`: the post is not one the app keeps track
+ * of, or the edit changed nothing it is compared by. `recorded`: the post was
+ * recorded as it is now. `gone`: it turned out to be deleted, and was erased.
+ * `removed`: the edit made it a repost, and it was removed.
+ */
+export type EditOutcome =
+  | { action: 'ignored' }
+  | { action: 'duplicate-event' }
+  | { action: 'recorded' }
+  | { action: 'gone' }
+  | { action: 'exempt'; reason: Reason; originalId: string; originalRemoved?: true }
+  | { action: 'removed'; reason: Reason; originalId: string; originalRemoved?: true };
+
 type Entry = { id: string; at: number };
 type PostRecord = { at: number; keys: string[] };
+/** A post that another post may be a repost of, and what the two share. */
+type Candidate = { reason: Reason; id: string; at: number; key?: string };
+/** What a search for a post's original found. */
+type Search = {
+  match?: Candidate;
+  /** The original is a post that a moderator removed. */
+  originalRemoved: boolean;
+  /** What Reddit said about the original, when it was asked. */
+  info?: PostInfo;
+  /** Fingerprints whose owner no longer counts, which the post may take over. */
+  replaceable: Set<string>;
+};
+type InfoReader = (id: string) => Promise<PostInfo | undefined>;
 
 const REASON_TEXT: Record<Reason, string> = {
   crosspost: "it is a crosspost of a recent post from this subreddit",
@@ -507,12 +539,138 @@ async function indexPost(
   return true;
 }
 
+/** Reads what Reddit says about a post, once for each post. A post that cannot be read gives `undefined`. */
+function infoReader(deps: Deps): InfoReader {
+  const cache = new Map<string, PostInfo | undefined>();
+  return async (id) => {
+    if (!cache.has(id)) {
+      let info: PostInfo | undefined;
+      try {
+        info = await deps.reddit.getPostInfo(id);
+      } catch (error) {
+        deps.log?.(`could not read ${id}: ${String(error)}`);
+      }
+      cache.set(id, info);
+    }
+    return cache.get(id);
+  };
+}
+
+/**
+ * Looks among the candidates for a post that still counts as an original of
+ * `post`. `since` is when the post came to say what it says: when it was made
+ * or, for an edit, now. `allowedId` is a post it is allowed to repeat.
+ */
+async function findOriginal(
+  post: IncomingPost,
+  candidates: Candidate[],
+  since: number,
+  settings: Settings,
+  deps: Deps,
+  getInfo: InfoReader,
+  allowedId?: string
+): Promise<Search> {
+  const { store } = deps;
+  const cooldownMs = settings.cooldownDays * DAY_MS;
+  const replaceable = new Set<string>();
+  for (const candidate of candidates) {
+    if (candidate.id === post.id || candidate.id === allowedId) continue;
+    const age = since - candidate.at;
+    if (age >= cooldownMs) {
+      if (candidate.key) replaceable.add(candidate.key);
+      continue;
+    }
+    if (age < 0) continue;
+    const removedKey = `removed:${candidate.id}`;
+    const marked = Boolean(await store.get(removedKey));
+    if (marked && settings.checkRemovedPosts) {
+      // A moderator removed it, and the subreddit wants that to count. For
+      // such a post the app goes by what Reddit has told it, and does not
+      // ask what became of the post since. Reddit reports an approval. It
+      // reports nothing when the author of a removed post deletes it, so
+      // that post keeps counting until its time is up.
+      return { match: candidate, originalRemoved: true, replaceable };
+    }
+    // Any other post counts as an original only while it is up. When that
+    // cannot be confirmed, leave the post alone rather than remove it on a
+    // guess.
+    const info = await getInfo(candidate.id);
+    if (!info) continue;
+    if (info.state === 'up') {
+      // A mark that a moderator once removed it is out of date here.
+      if (marked) await drop(store, removedKey);
+      return { match: candidate, originalRemoved: false, info, replaceable };
+    }
+    // Deleted by its author, or removed in a way that does not count: it is
+    // erased, here and now if the event that said so never arrived.
+    await forgetPost(candidate.id, deps);
+    if (candidate.key) replaceable.add(candidate.key);
+  }
+  return { originalRemoved: false, replaceable };
+}
+
+/** The part of an outcome that says which post was repeated, and how. */
+function describe(match: Candidate, search: Search): { reason: Reason; originalId: string; originalRemoved?: true } {
+  return { reason: match.reason, originalId: match.id, ...(search.originalRemoved ? { originalRemoved: true as const } : {}) };
+}
+
+/**
+ * Removes `post` as a repost of `match`, tells its author why in a comment,
+ * and leaves a note for the moderators. `since` is as in findOriginal.
+ */
+async function removeAsRepost(
+  post: IncomingPost,
+  match: Candidate,
+  search: Search,
+  since: number,
+  settings: Settings,
+  deps: Deps,
+  afterEdit = false
+): Promise<void> {
+  const { store, reddit } = deps;
+  await reddit.remove(post.id);
+
+  const ageMs = since - match.at;
+  if (settings.leaveComment) {
+    const template = search.originalRemoved ? settings.removedOriginalMessage : settings.removalMessage;
+    const text = renderRemovalMessage(template, {
+      author: post.authorName,
+      reason: match.reason,
+      original: permalinkOf(search.info, match.id),
+      ageMs,
+      cooldownDays: settings.cooldownDays,
+      subreddit: post.subredditName,
+    });
+    try {
+      const commentId = await reddit.comment(post.id, text);
+      // Remembered so that the comment can be taken off if a moderator approves the post after all.
+      if (commentId) {
+        const commentKey = `comment:${post.id}`;
+        const keptFor = Math.min(settings.cooldownDays * DAY_MS + HOUR_MS, RETENTION_MS);
+        await listKeys([commentKey], deps);
+        await store.set(commentKey, commentId, { expiration: new Date(deps.now() + keptFor) });
+      }
+    } catch (error) {
+      deps.log?.(`removed ${post.id} but could not comment: ${String(error)}`);
+    }
+  }
+  try {
+    // Mod notes are limited to 100 characters.
+    const what = match.reason === 'crosspost' ? 'crosspost of' : `same ${match.reason} as`;
+    const which = search.originalRemoved ? `${match.id} (removed by a mod)` : match.id;
+    const how = afterEdit ? 'edited, ' : '';
+    await reddit.addRemovalNote(post.id, `Repost Cooldown: ${how}${what} ${which}, made ${formatAge(ageMs)}`);
+  } catch (error) {
+    deps.log?.(`removed ${post.id} but could not add a removal note: ${String(error)}`);
+  }
+}
+
 /**
  * Handles a newly submitted post: removes it when it repeats a post that is
  * still inside the cooldown, otherwise remembers it as an original.
  */
 export async function handleNewPost(post: IncomingPost, settings: Settings, deps: Deps): Promise<Outcome> {
-  const { store, reddit } = deps;
+  const { store } = deps;
   const cooldownMs = settings.cooldownDays * DAY_MS;
 
   // Reddit can deliver the same event more than once, even at the same moment.
@@ -532,21 +690,7 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
 
     const prints = fingerprintsOf(post, settings);
 
-    const infoCache = new Map<string, PostInfo | undefined>();
-    const getInfo = async (id: string): Promise<PostInfo | undefined> => {
-      if (!infoCache.has(id)) {
-        let info: PostInfo | undefined;
-        try {
-          info = await reddit.getPostInfo(id);
-        } catch (error) {
-          deps.log?.(`could not read ${id}: ${String(error)}`);
-        }
-        infoCache.set(id, info);
-      }
-      return infoCache.get(id);
-    };
-
-    type Candidate = { reason: Reason; id: string; at: number; key?: string };
+    const getInfo = infoReader(deps);
     const candidates: Candidate[] = [];
 
     // The post this one is a crosspost of. A plain link to a post is treated like a crosspost of it.
@@ -569,95 +713,24 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
       if (entry) candidates.push({ reason: print.kind, id: entry.id, at: entry.at, key: print.key });
     }
 
-    const replaceable = new Set<string>();
-    let match: Candidate | undefined;
-    /** The original is a post that a moderator removed. */
-    let originalRemoved = false;
-    for (const candidate of candidates) {
-      if (candidate.id === post.id) continue;
-      // With the crosspost check switched off, crossposts are allowed: one is
-      // not a repost of the very post it shows, whose link and title it carries.
-      if (!settings.checkCrossposts && candidate.id === parentId) continue;
-      const age = post.createdAt - candidate.at;
-      if (age >= cooldownMs) {
-        if (candidate.key) replaceable.add(candidate.key);
-        continue;
-      }
-      if (age < 0) continue;
-      const removedKey = `removed:${candidate.id}`;
-      const marked = Boolean(await store.get(removedKey));
-      if (marked && settings.checkRemovedPosts) {
-        // A moderator removed it, and the subreddit wants that to count. For
-        // such a post the app goes by what Reddit has told it, and does not
-        // ask what became of the post since. Reddit reports an approval. It
-        // reports nothing when the author of a removed post deletes it, so
-        // that post keeps counting until its time is up.
-        match = candidate;
-        originalRemoved = true;
-        break;
-      }
-      // Any other post counts as an original only while it is up. When that
-      // cannot be confirmed, leave the new post alone rather than remove it on
-      // a guess.
-      const info = await getInfo(candidate.id);
-      if (!info) continue;
-      if (info.state === 'up') {
-        // A mark that a moderator once removed it is out of date here.
-        if (marked) await drop(store, removedKey);
-        match = candidate;
-        break;
-      }
-      // Deleted by its author, or removed in a way that does not count: it is
-      // erased, here and now if the event that said so never arrived.
-      await forgetPost(candidate.id, deps);
-      if (candidate.key) replaceable.add(candidate.key);
-    }
+    // With the crosspost check switched off, crossposts are allowed: one is
+    // not a repost of the very post it shows, whose link and title it carries.
+    const allowedId = settings.checkCrossposts ? undefined : parentId;
+    const search = await findOriginal(post, candidates, post.createdAt, settings, deps, getInfo, allowedId);
+    const { match, replaceable } = search;
 
     if (!match) {
       const kept = !gone && (await indexPost(post, prints, cooldownMs, deps, { replaceable }));
       return kept ? { action: 'indexed', compared: [...new Set(prints.map((print) => print.kind))] } : { action: 'gone' };
     }
-    const found = { reason: match.reason, originalId: match.id, ...(originalRemoved ? { originalRemoved: true as const } : {}) };
+    const found = describe(match, search);
 
     if (await isExempt(post, settings, deps)) {
       if (!gone) await indexPost(post, prints, cooldownMs, deps, { replaceable });
       return { action: 'exempt', ...found };
     }
 
-    await reddit.remove(post.id);
-
-    const ageMs = post.createdAt - match.at;
-    if (settings.leaveComment) {
-      const template = originalRemoved ? settings.removedOriginalMessage : settings.removalMessage;
-      const text = renderRemovalMessage(template, {
-        author: post.authorName,
-        reason: match.reason,
-        original: permalinkOf(infoCache.get(match.id), match.id),
-        ageMs,
-        cooldownDays: settings.cooldownDays,
-        subreddit: post.subredditName,
-      });
-      try {
-        const commentId = await reddit.comment(post.id, text);
-        // Remembered so that the comment can be taken off if a moderator approves the post after all.
-        if (commentId) {
-          const commentKey = `comment:${post.id}`;
-          const keptFor = Math.min(cooldownMs + HOUR_MS, RETENTION_MS);
-          await listKeys([commentKey], deps);
-          await store.set(commentKey, commentId, { expiration: new Date(deps.now() + keptFor) });
-        }
-      } catch (error) {
-        deps.log?.(`removed ${post.id} but could not comment: ${String(error)}`);
-      }
-    }
-    try {
-      // Mod notes are limited to 100 characters.
-      const what = match.reason === 'crosspost' ? 'crosspost of' : `same ${match.reason} as`;
-      const which = originalRemoved ? `${match.id} (removed by a mod)` : match.id;
-      await reddit.addRemovalNote(post.id, `Repost Cooldown: ${what} ${which}, made ${formatAge(ageMs)}`);
-    } catch (error) {
-      deps.log?.(`removed ${post.id} but could not add a removal note: ${String(error)}`);
-    }
+    await removeAsRepost(post, match, search, post.createdAt, settings, deps);
     return { action: 'removed', ...found };
   } catch (error) {
     // Let a redelivered event try again.
@@ -854,8 +927,14 @@ export async function forgetUnlisted(
 /**
  * Re-reads a post that was edited: gives up what it no longer contains and
  * records what it contains now, so that nothing is kept of a link or text
- * that is no longer there. An edit never gets a post removed. Returns whether
- * the post was read again.
+ * that is no longer there.
+ *
+ * An edit can also turn a post into a repost: its author posts something
+ * else, then edits in the text or the link of another post. Whatever the edit
+ * added that another post already has is checked the way a new post is, and a
+ * match gets the edited post removed. What the post was recorded with before
+ * the edit is not checked again, so a post that a moderator approved, or one
+ * by a moderator, is not removed for what it already said.
  *
  * `textUnchanged` says that the event shows the same text before and after.
  * The settings are only asked for when the post has to be read again.
@@ -865,35 +944,109 @@ export async function handlePostEdited(
   loadSettings: () => Promise<Settings>,
   deps: Deps,
   textUnchanged = false
-): Promise<boolean> {
+): Promise<EditOutcome> {
   const { store, reddit } = deps;
   // A post the app removed, one that was erased, one past the cooldown, or one
   // it never saw has no record.
-  const record = readRecord(await store.get(`post:${post.id}`));
-  if (!record) return false;
+  const recordKey = `post:${post.id}`;
+  const record = readRecord(await store.get(recordKey));
+  if (!record) return { action: 'ignored' };
 
-  let edited = post;
+  /** The post as it is on Reddit now, or `undefined` when it cannot be read. */
+  const readNow = (otherwise: string) =>
+    reddit.getPost(post.id).catch((error: unknown) => {
+      deps.log?.(`${post.id} was edited but could not be read, so ${otherwise}: ${String(error)}`);
+      return undefined;
+    });
+  // The post keeps the age it was recorded with; an edit does not restart its cooldown.
+  const recordAs = (edited: IncomingPost, prints: Fingerprint[], settings: Settings, replaceable?: ReadonlySet<string>) =>
+    indexPost({ ...edited, createdAt: record.at }, prints, settings.cooldownDays * DAY_MS, deps, { replaceable });
+
   if (await store.get(`removed:${post.id}`)) {
     // A moderator removed this post. Reddit may blank out the text of a
     // removed post in the event, so the post is read from Reddit itself. If
     // that fails there is no telling what the post says now, and it is erased
     // rather than kept as it was.
-    const found = await reddit.getPost(post.id).catch((error: unknown) => {
-      deps.log?.(`${post.id} was edited but could not be read, so it is erased: ${String(error)}`);
-      return undefined;
-    });
+    const found = await readNow('it is erased');
     if (!found || found.state === 'deleted') {
       await forgetPost(post.id, deps);
-      return false;
+      return { action: 'gone' };
     }
-    edited = found.post;
-  } else if (textUnchanged) {
-    // A post's title and link cannot be edited, so nothing it is compared by has changed.
-    return false;
+    // It is down already, so there is nothing to remove.
+    const settings = await loadSettings();
+    const kept = await recordAs(found.post, fingerprintsOf(found.post, settings), settings);
+    return { action: kept ? 'recorded' : 'gone' };
   }
+  // A post's title and link cannot be edited, so nothing it is compared by has changed.
+  if (textUnchanged) return { action: 'ignored' };
+
   const settings = await loadSettings();
-  // The post keeps the age it was recorded with; an edit does not restart its cooldown.
-  return indexPost({ ...edited, createdAt: record.at }, fingerprintsOf(edited, settings), settings.cooldownDays * DAY_MS, deps);
+  const had = new Set(record.keys);
+  /** The posts that already have something the edit put into this one. */
+  const copiedFrom = async (prints: Fingerprint[]): Promise<Candidate[]> => {
+    const candidates: Candidate[] = [];
+    for (const print of prints) {
+      if (had.has(print.key)) continue;
+      const entry = readEntry(await store.get(print.key));
+      if (entry && entry.id !== post.id) candidates.push({ reason: print.kind, id: entry.id, at: entry.at, key: print.key });
+    }
+    return candidates;
+  };
+
+  let edited = post;
+  let prints = fingerprintsOf(edited, settings);
+  let candidates = await copiedFrom(prints);
+  if (candidates.length > 0) {
+    // The edit seems to copy another post. Events arrive late and out of
+    // order, and this one may show a text the post no longer has, so before
+    // anything is removed the post is read from Reddit: what it says now
+    // decides. If it cannot be read, it is not removed on a guess.
+    const found = await readNow('it is not checked for a repost');
+    if (found?.state === 'deleted') {
+      await forgetPost(post.id, deps);
+      return { action: 'gone' };
+    }
+    if (found) {
+      // Only the text can change in an edit. The event may lack the author's name.
+      edited = { ...post, body: found.post.body ?? '', authorName: post.authorName || found.post.authorName };
+      prints = fingerprintsOf(edited, settings);
+    }
+    // A post that is down already is not removed a second time.
+    candidates = found?.state === 'up' ? await copiedFrom(prints) : [];
+  }
+
+  // The time that counts is now: this is when the post came to say what it says.
+  const now = deps.now();
+  const search = await findOriginal(edited, candidates, now, settings, deps, infoReader(deps));
+  const { match, replaceable } = search;
+  if (!match) return { action: (await recordAs(edited, prints, settings, replaceable)) ? 'recorded' : 'gone' };
+  const found = describe(match, search);
+
+  if (await isExempt(edited, settings, deps)) {
+    await recordAs(edited, prints, settings, replaceable);
+    return { action: 'exempt', ...found };
+  }
+
+  // Reddit can deliver the same event more than once, even at the same moment.
+  // "Set if absent", then read back: only the delivery whose token was stored
+  // goes on, so the post is never removed and commented on twice.
+  const claimKey = `editing:${post.id}`;
+  const token = randomUUID();
+  await listKeys([claimKey], deps);
+  await store.set(claimKey, token, { nx: true, expiration: new Date(now + CLAIM_MS) });
+  if ((await store.get(claimKey)) !== token) return { action: 'duplicate-event' };
+  try {
+    // A delivery that was here before this one erased the record when it was done.
+    if (!(await store.get(recordKey))) return { action: 'duplicate-event' };
+    await removeAsRepost(edited, match, search, now, settings, deps, true);
+    // It is down now, removed by an app, so nothing of it is kept. This comes
+    // last: if the removal fails, the record is still there for the event to
+    // be handled again.
+    await forgetPost(post.id, deps);
+  } finally {
+    await drop(store, claimKey);
+  }
+  return { action: 'removed', ...found };
 }
 
 /**

@@ -175,8 +175,7 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   // only: no usernames, links or text from the subreddits that install the app.
   const who = post.id;
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
-    const original = outcome.originalRemoved ? `${outcome.originalId}, which a moderator removed` : outcome.originalId;
-    log(`${who}: ${outcome.action} (${outcome.reason} match with ${original})`);
+    log(`${who}: ${outcome.action} (${matchOf(outcome)})`);
   } else if (outcome.action === 'gone') {
     log(`${who}: already deleted or removed, nothing recorded`);
   } else if (outcome.action === 'indexed') {
@@ -190,12 +189,28 @@ async function onPostSubmit(event: OnPostSubmitRequest): Promise<void> {
   }
 }
 
-/** An edit can add or take away the links and text a post is compared by. */
+/** Which post was repeated and how, for the log. */
+function matchOf(outcome: { reason: string; originalId: string; originalRemoved?: true }): string {
+  const original = outcome.originalRemoved ? `${outcome.originalId}, which a moderator removed` : outcome.originalId;
+  return `${outcome.reason} match with ${original}`;
+}
+
+/**
+ * An edit can add or take away the links and text a post is compared by, and
+ * it can turn the post into a repost, which gets it removed.
+ */
 async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
   const post = incomingPost(event);
   if (!post) return;
   const textUnchanged = (event.previousBody ?? '') === (post.body ?? '');
-  if (await handlePostEdited(post, loadSettings, deps(), textUnchanged)) log(`${post.id}: edited, recorded again`);
+  const outcome = await handlePostEdited(post, loadSettings, deps(), textUnchanged);
+  if (outcome.action === 'removed' || outcome.action === 'exempt') {
+    log(`${post.id}: edited into a repost, ${outcome.action} (${matchOf(outcome)})`);
+  } else if (outcome.action === 'recorded') {
+    log(`${post.id}: edited, recorded again`);
+  } else if (outcome.action === 'gone') {
+    log(`${post.id}: edited, but deleted by now, so erased`);
+  }
 }
 
 /**
