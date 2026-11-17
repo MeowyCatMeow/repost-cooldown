@@ -831,7 +831,7 @@ test('a link that is edited into a post counts like one it was posted with', asy
 
 test('an edit is judged by what the post says on Reddit now, not by what the event shows', async () => {
   const w = new World();
-  await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
+  const first = await w.submit({ title: 'Where the text was posted first', body: COPIED, isSelf: true });
   const second = await w.submit({ title: 'Something else entirely for now', body: FILLER, isSelf: true });
 
   // Two edits in a row, the copy and then words of its own, and the event for the first one arrives last.
@@ -843,25 +843,59 @@ test('an edit is judged by what the post says on Reddit now, not by what the eve
   const third = await w.submit({ title: 'A third post, with those words', body: own, isSelf: true });
   assert.deepEqual(third.outcome, { action: 'removed', reason: 'text', originalId: second.post.id });
 
-  // A post that cannot be read is not removed on a guess.
+  // A post that cannot be read is not removed on a guess. Nothing about it is
+  // changed either: recorded from the event, the copy would pass for something
+  // the post always said.
   const fourth = await w.submit({ title: 'A fourth post under its own title', body: FILLER, isSelf: true });
+  const recorded = w.data.get(`post:${fourth.post.id}`)!.value;
   w.unreadable.add(fourth.post.id);
-  assert.deepEqual(await w.edit(fourth.post, COPIED), { action: 'recorded' });
+  await assert.rejects(w.edit(fourth.post, COPIED), /cannot read/);
   assert.deepEqual(w.removed, [third.post.id]);
+  assert.equal(w.data.get(`post:${fourth.post.id}`)!.value, recorded);
+  // So when the event is handled again and the post can be read, it is removed.
   w.unreadable.delete(fourth.post.id);
+  assert.deepEqual(await w.edit(fourth.post, COPIED), { action: 'removed', reason: 'text', originalId: first.post.id });
+  assert.deepEqual(w.removed, [third.post.id, fourth.post.id]);
 
   // One that is already down is not removed a second time.
   const fifth = await w.submit({ title: 'A fifth post under its own title', body: `${FILLER} Again.`, isSelf: true });
   w.posts.get(fifth.post.id)!.state = 'removed';
   assert.deepEqual(await w.edit(fifth.post, COPIED), { action: 'recorded' });
-  assert.deepEqual(w.removed, [third.post.id]);
-  assert.equal(w.comments.length, 1);
+  assert.deepEqual(w.removed, [third.post.id, fourth.post.id]);
+  assert.equal(w.comments.length, 2);
 
   // One that was deleted in the meantime is erased.
   const sixth = await w.submit({ title: 'A sixth post under its own title', body: `${FILLER} Once more.`, isSelf: true });
   w.posts.get(sixth.post.id)!.state = 'deleted';
   assert.deepEqual(await w.edit(sixth.post, COPIED), { action: 'gone' });
   assert.deepEqual(recordOf(w, sixth.post.id), []);
+});
+
+test('an edit event that shows no text is checked against Reddit', async () => {
+  const w = new World();
+  const first = await w.submit({ title: 'First write-up about the product', body: `Details here: ${VIDEO}`, isSelf: true });
+  const before = JSON.stringify([...w.data]);
+  const noText = { ...first.post, body: '' };
+
+  // The event is about something other than the text, and carries none. The post still says what it said.
+  assert.deepEqual(await handlePostEdited(noText, settings, w.deps), { action: 'ignored' });
+  assert.equal(JSON.stringify([...w.data]), before);
+
+  // When Reddit cannot be asked, nothing is given up on the event's word.
+  w.unreadable.add(first.post.id);
+  await assert.rejects(handlePostEdited(noText, settings, w.deps), /cannot read/);
+  assert.equal(JSON.stringify([...w.data]), before);
+  w.unreadable.delete(first.post.id);
+
+  // The author did empty the post: what it contained is given up.
+  assert.deepEqual(await w.edit(first.post, ''), { action: 'recorded' });
+  const video = await w.submit({ title: 'Just the video on its own', url: VIDEO });
+  assert.equal(video.outcome.action, 'indexed');
+
+  // An emptied post that turns out to be deleted is erased.
+  w.posts.get(first.post.id)!.state = 'deleted';
+  assert.deepEqual(await handlePostEdited(noText, settings, w.deps), { action: 'gone' });
+  assert.deepEqual(recordOf(w, first.post.id), []);
 });
 
 test('an edit does not get a post removed for what it already said', async () => {

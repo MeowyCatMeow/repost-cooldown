@@ -15,7 +15,7 @@ Try it in r/repost_cooldown_dev: post the same thing twice, and the second post 
 - **Same title**: the same words, ignoring capitals, punctuation and emoji. For a post with text, the text must match too. Titles under 12 letters are skipped.
 - **Same text**: the same words in the body, even under another title. Text under 40 letters is skipped.
 
-**Edits count too.** A post whose text is edited to match another post is removed, like a new repost. Only what the edit adds is checked, so a post is not removed for what it already said.
+**Edits count too.** If an edit adds text or a link that another post already has, the edited post is removed, like a new repost. Only what the edit adds is checked, so a post is not removed for what it already said.
 
 **And the earlier post is one of these:**
 

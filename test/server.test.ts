@@ -134,6 +134,20 @@ test('an edited post is read again', async () => {
   assert.deepEqual(state.removed, []);
 });
 
+test('an edit that empties a post frees what it contained', async () => {
+  const link = 'https://example.com/product-page';
+  const first = post({ title: 'First write-up about the product', text: `Details here: ${link}` });
+  await submit(first.event);
+  // The author deletes all the text. Reddit's event does not say what the text was before.
+  state.posts.get(first.id)!.body = '';
+  const emptied = { ...first.event, post: { ...first.event.post, selftext: '' } };
+  assert.equal((await call('/internal/triggers/post-update', { type: 'PostUpdate', ...emptied })).status, 200);
+
+  const second = post({ title: 'The product page on its own', url: link });
+  await submit(second.event);
+  assert.deepEqual(state.removed, []);
+});
+
 test('a post that is edited into a copy of another post is removed', async () => {
   const text = 'This is the whole text of the first post, and it is long enough to be compared.';
   const filler = 'Nothing to see here yet, so please come back a little later today.';

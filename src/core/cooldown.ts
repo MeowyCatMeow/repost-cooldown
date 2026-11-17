@@ -13,7 +13,7 @@
  *   removed:<id>     -> "1"            a moderator removed the post; it is still on Reddit and still counts as an original
  *   comment:<id>     -> a comment id   the removal comment the app left on a post it removed
  *   editing:<id>     -> a token        the post was edited into a repost and is being removed; gone when that is done
- *   recorded        -> a sorted set   the ids of the posts that have a record, by the time they were made
+ *   recorded         -> a sorted set  the ids of the posts that have a record, by the time they were made
  *   keys             -> a sorted set   the name of every key above that the app has written
  *
  * Nothing here names a person, and no title, text or link is kept: a
@@ -273,8 +273,11 @@ export type Outcome =
 /**
  * What became of an edit. `ignored`: the post is not one the app keeps track
  * of, or the edit changed nothing it is compared by. `recorded`: the post was
- * recorded as it is now. `gone`: it turned out to be deleted, and was erased.
- * `removed`: the edit made it a repost, and it was removed.
+ * recorded as it is now. `gone`: it was erased, because it turned out to be
+ * deleted or removed, or could not be read. `removed`: the edit made it a
+ * repost, and it was removed. `exempt`: it would have been, but its author is
+ * never removed. `duplicate-event`: another delivery of the same event is
+ * removing it, or has.
  */
 export type EditOutcome =
   | { action: 'ignored' }
@@ -539,6 +542,19 @@ async function indexPost(
   return true;
 }
 
+/**
+ * Takes hold of `key` for one delivery of an event, for `heldMs` at most.
+ * Reddit can deliver the same event more than once, even at the same moment.
+ * "Set if absent", then read back: only the delivery whose token was stored
+ * is told yes.
+ */
+async function claim(key: string, heldMs: number, deps: Pick<Deps, 'store' | 'now'>): Promise<boolean> {
+  const token = randomUUID();
+  await listKeys([key], deps);
+  await deps.store.set(key, token, { nx: true, expiration: new Date(deps.now() + heldMs) });
+  return (await deps.store.get(key)) === token;
+}
+
 /** Reads what Reddit says about a post, once for each post. A post that cannot be read gives `undefined`. */
 function infoReader(deps: Deps): InfoReader {
   const cache = new Map<string, PostInfo | undefined>();
@@ -673,14 +689,9 @@ export async function handleNewPost(post: IncomingPost, settings: Settings, deps
   const { store } = deps;
   const cooldownMs = settings.cooldownDays * DAY_MS;
 
-  // Reddit can deliver the same event more than once, even at the same moment.
-  // "Set if absent", then read back: only the delivery whose token was stored
-  // goes on, so a post is never removed and commented on twice.
+  // Only one delivery of the event goes on, so a post is never removed and commented on twice.
   const seenKey = `seen:${post.id}`;
-  const token = randomUUID();
-  await listKeys([seenKey], deps);
-  await store.set(seenKey, token, { nx: true, expiration: new Date(deps.now() + LATE_EVENT_MS) });
-  if ((await store.get(seenKey)) !== token) return { action: 'duplicate-event' };
+  if (!(await claim(seenKey, LATE_EVENT_MS, deps))) return { action: 'duplicate-event' };
 
   try {
     // Events arrive late and out of order: the post may already be deleted or
@@ -936,8 +947,9 @@ export async function forgetUnlisted(
  * the edit is not checked again, so a post that a moderator approved, or one
  * by a moderator, is not removed for what it already said.
  *
- * `textUnchanged` says that the event shows the same text before and after.
- * The settings are only asked for when the post has to be read again.
+ * `textUnchanged` says that the event names the text from before the edit,
+ * and that it is the text the post has now. The settings are only asked for
+ * when the post has to be read again.
  */
 export async function handlePostEdited(
   post: IncomingPost,
@@ -952,12 +964,6 @@ export async function handlePostEdited(
   const record = readRecord(await store.get(recordKey));
   if (!record) return { action: 'ignored' };
 
-  /** The post as it is on Reddit now, or `undefined` when it cannot be read. */
-  const readNow = (otherwise: string) =>
-    reddit.getPost(post.id).catch((error: unknown) => {
-      deps.log?.(`${post.id} was edited but could not be read, so ${otherwise}: ${String(error)}`);
-      return undefined;
-    });
   // The post keeps the age it was recorded with; an edit does not restart its cooldown.
   const recordAs = (edited: IncomingPost, prints: Fingerprint[], settings: Settings, replaceable?: ReadonlySet<string>) =>
     indexPost({ ...edited, createdAt: record.at }, prints, settings.cooldownDays * DAY_MS, deps, { replaceable });
@@ -967,7 +973,10 @@ export async function handlePostEdited(
     // removed post in the event, so the post is read from Reddit itself. If
     // that fails there is no telling what the post says now, and it is erased
     // rather than kept as it was.
-    const found = await readNow('it is erased');
+    const found = await reddit.getPost(post.id).catch((error: unknown) => {
+      deps.log?.(`${post.id} was edited but could not be read, so it is erased: ${String(error)}`);
+      return undefined;
+    });
     if (!found || found.state === 'deleted') {
       await forgetPost(post.id, deps);
       return { action: 'gone' };
@@ -995,24 +1004,50 @@ export async function handlePostEdited(
 
   let edited = post;
   let prints = fingerprintsOf(edited, settings);
+  /** Whether the post is up, once Reddit has been asked. */
+  let state: PostState | undefined;
+  /**
+   * Puts what the post says on Reddit now in the place of what the event
+   * shows, and tells whether the post is up. Reddit is asked once.
+   *
+   * If the post cannot be read, the error goes up and nothing is changed, so
+   * that the event can be handled again. Carrying on with what the event
+   * shows would be a guess, and recording that would make a copy look like
+   * something the post always said: no later edit would get it checked.
+   */
+  const readNow = async (): Promise<PostState> => {
+    if (!state) {
+      const found = await reddit.getPost(post.id);
+      state = found.state;
+      // Only the text can change in an edit. The event may lack the author's name.
+      edited = { ...post, body: found.post.body ?? '', authorName: post.authorName || found.post.authorName };
+      prints = fingerprintsOf(edited, settings);
+    }
+    return state;
+  };
+  const erase = async (): Promise<EditOutcome> => {
+    await forgetPost(post.id, deps);
+    return { action: 'gone' };
+  };
+
+  // An event that shows no text is not taken at its word. The author may have
+  // emptied the post, or the event may be about something else and carry no
+  // text at all: then recording the post as empty would give up everything
+  // it is compared by.
+  if (!post.body && (await readNow()) === 'deleted') return erase();
+  // Nothing the post is compared by has changed.
+  if (prints.length === had.size && prints.every((print) => had.has(print.key))) return { action: 'ignored' };
+
   let candidates = await copiedFrom(prints);
   if (candidates.length > 0) {
     // The edit seems to copy another post. Events arrive late and out of
     // order, and this one may show a text the post no longer has, so before
     // anything is removed the post is read from Reddit: what it says now
-    // decides. If it cannot be read, it is not removed on a guess.
-    const found = await readNow('it is not checked for a repost');
-    if (found?.state === 'deleted') {
-      await forgetPost(post.id, deps);
-      return { action: 'gone' };
-    }
-    if (found) {
-      // Only the text can change in an edit. The event may lack the author's name.
-      edited = { ...post, body: found.post.body ?? '', authorName: post.authorName || found.post.authorName };
-      prints = fingerprintsOf(edited, settings);
-    }
+    // decides.
+    const current = await readNow();
+    if (current === 'deleted') return erase();
     // A post that is down already is not removed a second time.
-    candidates = found?.state === 'up' ? await copiedFrom(prints) : [];
+    candidates = current === 'up' ? await copiedFrom(prints) : [];
   }
 
   // The time that counts is now: this is when the post came to say what it says.
@@ -1027,14 +1062,9 @@ export async function handlePostEdited(
     return { action: 'exempt', ...found };
   }
 
-  // Reddit can deliver the same event more than once, even at the same moment.
-  // "Set if absent", then read back: only the delivery whose token was stored
-  // goes on, so the post is never removed and commented on twice.
+  // Only one delivery of the event goes on, so the post is never removed and commented on twice.
   const claimKey = `editing:${post.id}`;
-  const token = randomUUID();
-  await listKeys([claimKey], deps);
-  await store.set(claimKey, token, { nx: true, expiration: new Date(now + CLAIM_MS) });
-  if ((await store.get(claimKey)) !== token) return { action: 'duplicate-event' };
+  if (!(await claim(claimKey, CLAIM_MS, deps))) return { action: 'duplicate-event' };
   try {
     // A delivery that was here before this one erased the record when it was done.
     if (!(await store.get(recordKey))) return { action: 'duplicate-event' };

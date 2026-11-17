@@ -202,14 +202,17 @@ function matchOf(outcome: { reason: string; originalId: string; originalRemoved?
 async function onPostUpdate(event: OnPostUpdateRequest): Promise<void> {
   const post = incomingPost(event);
   if (!post) return;
-  const textUnchanged = (event.previousBody ?? '') === (post.body ?? '');
+  // Reddit does not always say what the text was before. Without that, the
+  // text is not taken to be unchanged: an edit that empties a post must not
+  // look like no edit at all.
+  const textUnchanged = Boolean(event.previousBody) && event.previousBody === post.body;
   const outcome = await handlePostEdited(post, loadSettings, deps(), textUnchanged);
   if (outcome.action === 'removed' || outcome.action === 'exempt') {
     log(`${post.id}: edited into a repost, ${outcome.action} (${matchOf(outcome)})`);
   } else if (outcome.action === 'recorded') {
     log(`${post.id}: edited, recorded again`);
   } else if (outcome.action === 'gone') {
-    log(`${post.id}: edited, but deleted by now, so erased`);
+    log(`${post.id}: edited, and erased: it is deleted or removed by now, or could not be read`);
   }
 }
 
