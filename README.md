@@ -2,32 +2,45 @@
 
 Repost Cooldown keeps your sub from filling up with the same posts.
 
-If a new post repeats a post made in your sub within the last 30 days, the app removes it. It leaves a stickied comment that links to the original, and a mod note. Once the cooldown is over, the same thing can be posted again.
+A new post that repeats a post made in your sub in the last 30 days is removed, with a stickied comment that links to the original and a mod note. After the cooldown, the same thing can be posted again.
 
-You can try it in the test subreddit, r/repost_cooldown_dev: post the same thing twice, and the second post is removed.
+Try it in r/repost_cooldown_dev: post the same thing twice, and the second post is removed.
 
 ## What counts as a repost
 
-- **Crosspost**: a crosspost of a post from your subreddit, or a link to one.
-- **Same link**: the same address, however it is written. Links inside a post's text count too.
-- **Same title**: the same words, ignoring capitals, punctuation and emoji. For a post with text, the text has to match as well.
-- **Same text**: the same body text, even under a different title.
+**The new post matches an earlier one in one of these ways:**
+
+- **Crosspost**: it crossposts a post from your subreddit, or it is a link post whose link is that post. A text post that only mentions the link does not count.
+- **Same link**: it links to the same page, such as the same video or article, however the address is written. A site's front page, such as `youtube.com`, does not count. Links in a post's text count too, unless there are more than five or they point to Reddit.
+- **Same title**: the same words, ignoring capitals, punctuation and emoji. For a post with text, the text must match too. Titles under 12 letters are skipped.
+- **Same text**: the same words in the body, even under another title. Text under 40 letters is skipped.
+
+**And the earlier post is one of these:**
+
+| The earlier post | A repost of it is |
+| --- | --- |
+| Still up | Removed |
+| Deleted by its author | Allowed |
+| Removed by AutoModerator, Reddit or another app | Allowed |
+| Removed by a moderator | Allowed, or removed with the option below |
+| Removed by a moderator, then approved | Removed |
+| Removed by a moderator, then deleted by its author | Allowed, or removed with the option below |
+
+## Option: posts that a moderator removed
+
+Tick **Also remove reposts of posts that a moderator removed** in the settings. It is off unless you tick it.
+
+- A post that a moderator removes by hand keeps counting as the original until its cooldown ends, 30 days after the removal at most.
+- Deleting the removed post does not get around it. Reddit does not tell the app about that deletion, so the post keeps counting until its time is up.
+- Approving the post makes it an ordinary post again.
+- Only a person's removal counts. A bot that runs under an ordinary account can be named in the settings to leave its removals out.
 
 ## What is left alone
 
 - Posts by moderators, AutoModerator and the app itself.
-- Reposts of a post that was deleted, or removed by AutoModerator, Reddit or another app.
-- Very short titles such as "Help", and very short text.
-- Pictures: the same image under a new title is not caught.
-- Edits: an edit never gets a post removed.
-
-If you approve a post the app removed, it stays up and the app deletes its comment.
-
-## Option: posts that a moderator removed
-
-Tick **Also remove reposts of posts that a moderator removed** in the settings, and a post that a moderator removes by hand keeps counting as the original, so posting it again is removed too. It is off unless you tick it.
-
-It lasts until the post's cooldown ends, 30 days at most, or until a moderator approves the post. Deleting the removed post does not get around it: Reddit does not tell the app about that deletion, so the post keeps counting until its time is up.
+- Pictures and uploaded videos. The app does not look at them: it compares titles, text and links only.
+- Edited posts. An edit never gets a post removed, even when it makes the post a copy of another one.
+- A post you approve after the app removed it. It stays up, and the app deletes its comment.
 
 ## Settings
 
